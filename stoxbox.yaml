@@ -1687,7 +1687,6 @@ interval:
           condition:
             lambda: return id(g_market_open) || id(g_premarket) || id(g_aftermarket);
           then:
-#            - script.execute: fetch_all
             - script.execute:
                 id: fetch_one
                 slot: id(g_index)
@@ -1754,7 +1753,6 @@ lvgl:
             y: 4
             width: 185
             height: 32
-            long_mode: CLIP
         - label:
             id: info_version
             text: "--"
@@ -1774,7 +1772,6 @@ lvgl:
             y: 40
             width: 100
             height: 32
-#            long_mode: CLIP
         - label:
             id: info_build
             text: "--"
@@ -2265,9 +2262,6 @@ lvgl:
                   if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
                 }
                 if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
-#          - script.execute: fetch_currency
-#          - script.execute: get_tickers_shares
-#          - script.execute: fetch_all
           - lvgl.page.show:
               id: page_info
               animation: OUT_BOTTOM
@@ -2289,9 +2283,6 @@ lvgl:
                   if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
                 }
                 if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
-#          - script.execute: fetch_currency
-#          - script.execute: get_tickers_shares
-#          - script.execute: fetch_all
           - lvgl.page.show:
               id: page_quote
               animation: OUT_TOP
@@ -2466,62 +2457,26 @@ lvgl:
                 - light.turn_on:
                     id: display_backlight
                     brightness: !lambda 'return x / 100.0f;'
-#        - button:
-#            x: 16
-#            y: 300
-#            width: 90
-#            height: 44
-#            radius: 10
-##            bg_color: 0x267a58
-#            widgets:
-#              - label:
-#                  align: CENTER
-#                  text: "Save"
-#                  text_font: font_ui
-#                  text_color: 0xf2efe8
-#            on_click:
-#              then:
-#                - lambda: |-
-#                    const char *tsym = lv_textarea_get_text(id(ta_tickers));
-#                    const char *tsh = lv_textarea_get_text(id(ta_shares));
-#                    id(g_tickers_raw) = tsym ? std::string(tsym) : std::string("");
-#                    id(g_shares_raw) = tsh ? std::string(tsh) : std::string("");
-#                    id(ha_ticker_list).publish_state(id(g_tickers_raw));
-#                    id(ha_shares_list).publish_state(id(g_shares_raw));
-#                - script.execute: get_tickers_shares
-#                - script.execute: fetch_all
-#                - lvgl.page.show:
-#                    id: page_quote
-#                    animation: OUT_BOTTOM
-#                    time: 250ms
         - button:
             id: restart_button
             x: 16
             y: 300
-            width: 448
+            width: 140
             height: 52
             radius: 10
-            bg_color: 0x3A3834
+            bg_color: 0x800000
             widgets:
               - label:
                   align: CENTER
                   text: "Restart"
                   text_font: font_ui
-                  text_color: 0xf2efe8
+                  text_color: 0xf0f0f0
             on_click:
               then:
                 - script.execute: restart_device
         - keyboard:
             id: setup_kb
             hidden: true
-#            on_all_events:
-#              then:
-#                - lambda: |-
-#                    ESP_LOGD("keyboard_debug",
-#                               "keyboard event=%d hidden=%d visible=%d",
-#                               (int) lv_event_get_code(event),
-#                               (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN),
-#                               (int) lv_obj_is_visible(id(setup_kb).obj));
             align: BOTTOM_MID
             width: 480
             height: 180
