@@ -1,0 +1,2876 @@
+# StoxBox - ESPHome
+# Hardware: Guition ESP32-S3-4848S040 (480x480)
+# Author: pel@pel.hu
+# The ticker symbols and share counts come from the configuration fields (g_tickers_raw, g_shares_raw).
+# Up to 6 tickers. Multiple share counts: "10 4" or "10, 4", corresponding to the order of the tickers.
+#
+# secrets.yaml:
+#   wifi_ssid / wifi_password / api_encryption_key
+
+substitutions:
+  device_name: stoxbox
+  poll_seconds: "60s"
+  app_version: "0.2"
+  ha_topic: "stoxbox/quote"
+  
+esphome:
+  name: ${device_name}
+  includes:
+    - <esp_heap_caps.h>
+    - <esp_system.h>
+    - <esp_chip_info.h>
+    - <esp_flash.h>
+    - <esp_partition.h>
+    - <esp_ota_ops.h>
+    - <esp_idf_version.h>
+    - <esp_app_format.h>
+    - <esp_psram.h>
+    - <esp_wifi.h>
+  friendly_name: 'StoxBox'
+  min_version: "2025.2.0"
+  on_boot:
+    priority: -100
+    then:
+      - delay: 1s
+      - lvgl.textarea.update:
+          id: ta_tickers
+          text: !lambda 'return id(g_tickers_raw);'
+      - lvgl.textarea.update:
+          id: ta_shares
+          text: !lambda 'return id(g_shares_raw);'
+      - lvgl.textarea.update:
+          id: ta_currency
+          text: !lambda 'return id(g_currency_code);'
+      - lvgl.switch.update: 
+          id: sw_relay1
+          state:
+            checked: !lambda 'return id(g_relay1);'
+      - lambda: |-
+          id(ha_ticker_list).publish_state(id(g_tickers_raw));
+          id(ha_shares_list).publish_state(id(g_shares_raw));
+          id(ha_currency).publish_state(id(g_currency_code));
+          id(ha_relay1).publish_state(id(g_relay1));
+          // Version / build time
+          lv_obj_clear_flag(id(app_version), LV_OBJ_FLAG_HIDDEN);
+          lv_label_set_text(id(app_version), "StoxBox v${app_version}");
+          lv_label_set_text(id(info_version), "${app_version}");
+          lv_label_set_text(id(info_build), __DATE__ " " __TIME__);
+      - light.turn_on:
+          id: display_backlight
+          brightness: 0.5
+          transition_length: 0s
+      - lvgl.page.show:
+          id: page_splash
+          animation: fade_in
+          time: 500ms          
+      - wait_until:
+          condition:
+            wifi.connected:
+          timeout: 30s
+      - lambda: |-
+          char b[160];
+          
+          // CPU / chip revision
+          esp_chip_info_t chip_info;
+          esp_chip_info(&chip_info);
+          snprintf(b, sizeof(b), "ESP32-S3 rev %d.%d",
+                   chip_info.revision / 100, chip_info.revision % 100);
+          lv_label_set_text(id(info_cpu), b);
+
+          // Flash size
+          uint32_t flash_size = 0;
+          if (esp_flash_get_size(nullptr, &flash_size) == ESP_OK) {
+            snprintf(b, sizeof(b), "%lu MB", (unsigned long)(flash_size / (1024UL * 1024UL)));
+          } else {
+            snprintf(b, sizeof(b), "--");
+          }
+          lv_label_set_text(id(info_flash), b);
+          
+          // SSID
+          std::string ssid = id(wifi_ssid_info).state;
+          lv_label_set_text(id(info_ssid), ssid.empty() ? "" : ssid.c_str());
+      - delay: 2s
+      - script.execute: fetch_currency
+      - script.wait: fetch_currency  
+      - script.execute: get_tickers_shares
+#      - script.execute: paint_active
+      - lvgl.page.show:
+          id: page_quote
+          animation: fade_in
+          time: 500ms   
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+api:
+  encryption:
+    key: !secret stoxbox__encryption_key
+ota:
+  - platform: esphome
+    on_begin:
+      - light.turn_off:
+          id: display_backlight
+          transition_length: 0s
+      - lambda: "id(display_backlight).loop();"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 192.168.0.15
+  ap:
+    ssid: StoxBox-Setup
+    password: stockbox1234
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: America/New_York
+    on_time_sync:
+      then:
+        - script.execute: paint_session
+        - script.execute: fetch_all
+
+# mqtt: optional
+
+http_request:
+  useragent: StoxBox/1.0
+  timeout: 15s
+  verify_ssl: false
+
+spi:
+  - id: lcd_spi
+    clk_pin: GPIO48
+    mosi_pin: GPIO47
+
+i2c:
+  id: touchscreen_bus
+  sda: GPIO19
+  scl:
+    number: 45
+    ignore_strapping_warning: true
+
+output:
+  - platform: ledc
+    pin: GPIO38
+    id: backlight_output
+    frequency: 150Hz
+    min_power: 0.01
+    zero_means_zero: true
+
+light:
+  - platform: monochromatic
+    output: backlight_output
+    name: Backlight
+    id: display_backlight
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 1s
+    on_state:
+      then:
+        - lvgl.slider.update:
+            id: backlight_slider
+            value: !lambda |-
+              if (id(display_backlight).remote_values.is_on()) {
+                return id(display_backlight).remote_values.get_brightness() * 100.0f;
+              } else {
+                return 0.0f;
+              }
+
+display:
+  - platform: st7701s
+    id: tft_display
+    spi_id: lcd_spi
+    dimensions:
+      width: 480
+      height: 480
+    spi_mode: MODE3
+    data_rate: 2MHz
+    color_order: RGB
+    invert_colors: false
+    cs_pin: 39
+    de_pin: 18
+    hsync_pin: 16
+    vsync_pin: 17
+    pclk_pin: 21
+    pclk_frequency: 12MHz
+    pclk_inverted: false
+    hsync_pulse_width: 8
+    hsync_front_porch: 10
+    hsync_back_porch: 20
+    vsync_pulse_width: 8
+    vsync_front_porch: 10
+    vsync_back_porch: 10
+    update_interval: never
+    auto_clear_enabled: false
+    init_sequence:
+      - 1
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x10]
+      - [0xCD, 0x00]
+    data_pins:
+      red: [11, 12, 13, 14, 0]
+      green: [8, 20, 3, 46, 9, 10]
+      blue: [4, 5, 6, 7, 15]
+
+touchscreen:
+  - platform: gt911
+    id: tft_touch
+    display: tft_display
+    i2c_id: touchscreen_bus
+
+image:
+  - file: "logo.png"
+    id: img_applogo
+    type: RGB565
+    resize: 480x480
+  - file: "back.png"
+    id: img_infoback
+    type: RGB565
+    resize: 480x480
+
+font:
+  - file: "gfonts://Google Sans"
+    id: font_price
+    size: 100
+    glyphs: "0123456789., -"
+  - file: "gfonts://Google Sans"
+    id: font_chg
+    size: 32
+    glyphs: "0123456789.,-+% "
+  - file: "gfonts://Google Sans"
+    id: font_value
+    size: 52
+    glyphs: "0123456789.,-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz$€£¥ "
+  - file: "gfonts://Google Sans"
+    id: font_qty
+    size: 26
+    glyphs: "0123456789., share"
+  - file: "gfonts://Google Sans"
+    id: font_ui
+    size: 22
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~°"
+  - file: "gfonts://Google Sans"
+    id: font_setup
+    size: 24
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+  - file: "gfonts://Roboto Mono"
+    id: font_info
+    size: 25
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~°"
+
+globals:
+  - id: g_tickers_raw
+    type: std::string
+    restore_value: yes
+    initial_value: '"TSLA SPCX"'
+  - id: g_shares_raw
+    type: std::string
+    restore_value: yes
+    initial_value: '"626 0"'
+  - id: g_count
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: g_show_value
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_loaded_0
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_loaded_1
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_loaded_2
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_loaded_3
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_loaded_4
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_loaded_5
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_currency_code
+    type: std::string
+    restore_value: yes
+    initial_value: '"USD"'
+  - id: g_currency_symbol
+    type: std::string
+    restore_value: yes
+    initial_value: '"$"'
+  - id: g_fx_rate
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: g_fx_loaded
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_relay1
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_index
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: g_fetch_i
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: g_market_open
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_premarket
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_aftermarket
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_sym_0
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_name_0
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_spark_0
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_sh_0
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_price_0
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_chg_0
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_pct_0
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_hi_0
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_lo_0
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_ts_0
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: g_sym_1
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_name_1
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_spark_1
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_sh_1
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_price_1
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_chg_1
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_pct_1
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_hi_1
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_lo_1
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_ts_1
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: g_sym_2
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_name_2
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_spark_2
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_sh_2
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_price_2
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_chg_2
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_pct_2
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_hi_2
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_lo_2
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_ts_2
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: g_sym_3
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_name_3
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_spark_3
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_sh_3
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_price_3
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_chg_3
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_pct_3
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_hi_3
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_lo_3
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_ts_3
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: g_sym_4
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_name_4
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_spark_4
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_sh_4
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_price_4
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_chg_4
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_pct_4
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_hi_4
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_lo_4
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_ts_4
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: g_sym_5
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_name_5
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_spark_5
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: g_sh_5
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_price_5
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_chg_5
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_pct_5
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_hi_5
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_lo_5
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: g_ts_5
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+script:
+  - id: restart_device
+    mode: restart
+    then:
+      - lambda: |-
+          esp_restart();
+
+
+  - id: get_tickers_shares
+    then:
+      - lambda: |-
+            std::string raw = id(g_tickers_raw);
+            for (size_t k = 0; k < raw.size(); k++) {
+              char c = raw[k];
+              if (c >= 'a' && c <= 'z') raw[k] = (char) (c - 'a' + 'A');
+            }
+            lv_obj_add_flag(id(status_box), LV_OBJ_FLAG_HIDDEN);
+            std::string syms[6];
+            int ns = 0;
+            size_t p = 0;
+            while (p < raw.size() && ns < 6) {
+              while (p < raw.size() && (raw[p] == ' ' || raw[p] == ',' || raw[p] == ';' || raw[p] == '\n' || raw[p] == '\r' || raw[p] == '\t')) p++;
+              if (p >= raw.size()) break;
+              size_t j = p;
+              while (j < raw.size() && raw[j] != ' ' && raw[j] != ',' && raw[j] != ';' && raw[j] != '\n' && raw[j] != '\r' && raw[j] != '\t') j++;
+              std::string sym = raw.substr(p, j - p);
+              bool ok = !sym.empty() && sym.size() <= 15;
+              for (size_t c = 0; c < sym.size(); c++) {
+                char ch = sym[c];
+                bool good = (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '^' || ch == '-' || ch == '*' || ch == '=';
+                if (!good) ok = false;
+              }
+              if (ok) {
+                bool dup = false;
+                for (int d = 0; d < ns; d++) if (syms[d] == sym) dup = true;
+                if (!dup) syms[ns++] = sym;
+              }
+              p = j;
+            }
+            id(g_sym_0) = "";
+            id(g_sym_1) = "";
+            id(g_sym_2) = "";
+            id(g_sym_3) = "";
+            id(g_sym_4) = "";
+            id(g_sym_5) = "";
+            if (ns > 0) id(g_sym_0) = syms[0];
+            if (ns > 1) id(g_sym_1) = syms[1];
+            if (ns > 2) id(g_sym_2) = syms[2];
+            if (ns > 3) id(g_sym_3) = syms[3];
+            if (ns > 4) id(g_sym_4) = syms[4];
+            if (ns > 5) id(g_sym_5) = syms[5];
+            id(g_count) = ns;
+            if (ns == 0 || id(g_index) < 0 || id(g_index) >= ns) id(g_index) = 0;
+            std::string sr = id(g_shares_raw);
+            float shs[8];
+            int nh = 0;
+            size_t q = 0;
+            while (q < sr.size() && nh < 6) {
+              while (q < sr.size() && (sr[q] == ' ' || sr[q] == ',' || sr[q] == ';' || sr[q] == '\n' || sr[q] == '\t')) q++;
+              if (q >= sr.size()) break;
+              char *end = nullptr;
+              float v = strtof(sr.c_str() + q, &end);
+              if (end == sr.c_str() + q) { q++; continue; }
+              if (v < 0.0f) v = 0.0f;
+              shs[nh++] = v;
+              q = (size_t) (end - sr.c_str());
+            }
+            float out0 = 0, out1 = 0, out2 = 0, out3 = 0, out4 = 0, out5 = 0;
+            if (nh == 1) {
+              if (ns > 0) out0 = shs[0];
+              if (ns > 1) out1 = shs[0];
+              if (ns > 2) out2 = shs[0];
+              if (ns > 3) out3 = shs[0];
+              if (ns > 4) out4 = shs[0];
+              if (ns > 5) out5 = shs[0];
+            } else {
+              if (ns > 0 && nh > 0) out0 = shs[0];
+              if (ns > 1 && nh > 1) out1 = shs[1];
+              if (ns > 2 && nh > 2) out2 = shs[2];
+              if (ns > 3 && nh > 3) out3 = shs[3];
+              if (ns > 4 && nh > 4) out4 = shs[4];
+              if (ns > 5 && nh > 5) out5 = shs[5];
+            }
+            id(g_sh_0) = out0;
+            id(g_sh_1) = out1;
+            id(g_sh_2) = out2;
+            id(g_sh_3) = out3;
+            id(g_sh_4) = out4;
+            id(g_sh_5) = out5;
+      - script.execute: paint_active
+  - id: paint_active
+    then:
+      - lambda: |-
+            int n = id(g_count);
+            int i = id(g_index);
+            if (n < 1) i = 0;
+            else if (i < 0 || i >= n) i = 0;
+            id(g_index) = i;
+            std::string sym = id(g_sym_0);
+            if (i == 1) sym = id(g_sym_1);
+            if (i == 2) sym = id(g_sym_2);
+            if (i == 3) sym = id(g_sym_3);
+            if (i == 4) sym = id(g_sym_4);
+            if (i == 5) sym = id(g_sym_5);
+            std::string name = id(g_name_0);
+            if (i == 1) name = id(g_name_1);
+            if (i == 2) name = id(g_name_2);
+            if (i == 3) name = id(g_name_3);
+            if (i == 4) name = id(g_name_4);
+            if (i == 5) name = id(g_name_5);
+            std::string spark = id(g_spark_0);
+            if (i == 1) spark = id(g_spark_1);
+            if (i == 2) spark = id(g_spark_2);
+            if (i == 3) spark = id(g_spark_3);
+            if (i == 4) spark = id(g_spark_4);
+            if (i == 5) spark = id(g_spark_5);
+            float price = id(g_price_0);
+            if (i == 1) price = id(g_price_1);
+            if (i == 2) price = id(g_price_2);
+            if (i == 3) price = id(g_price_3);
+            if (i == 4) price = id(g_price_4);
+            if (i == 5) price = id(g_price_5);
+            float chg = id(g_chg_0);
+            if (i == 1) chg = id(g_chg_1);
+            if (i == 2) chg = id(g_chg_2);
+            if (i == 3) chg = id(g_chg_3);
+            if (i == 4) chg = id(g_chg_4);
+            if (i == 5) chg = id(g_chg_5);
+            float pct = id(g_pct_0);
+            if (i == 1) pct = id(g_pct_1);
+            if (i == 2) pct = id(g_pct_2);
+            if (i == 3) pct = id(g_pct_3);
+            if (i == 4) pct = id(g_pct_4);
+            if (i == 5) pct = id(g_pct_5);
+            float hi = id(g_hi_0);
+            if (i == 1) hi = id(g_hi_1);
+            if (i == 2) hi = id(g_hi_2);
+            if (i == 3) hi = id(g_hi_3);
+            if (i == 4) hi = id(g_hi_4);
+            if (i == 5) hi = id(g_hi_5);
+            float lo = id(g_lo_0);
+            if (i == 1) lo = id(g_lo_1);
+            if (i == 2) lo = id(g_lo_2);
+            if (i == 3) lo = id(g_lo_3);
+            if (i == 4) lo = id(g_lo_4);
+            if (i == 5) lo = id(g_lo_5);
+            float sh = id(g_sh_0);
+            if (i == 1) sh = id(g_sh_1);
+            if (i == 2) sh = id(g_sh_2);
+            if (i == 3) sh = id(g_sh_3);
+            if (i == 4) sh = id(g_sh_4);
+            if (i == 5) sh = id(g_sh_5);
+            int ts = id(g_ts_0);
+            if (i == 1) ts = id(g_ts_1);
+            if (i == 2) ts = id(g_ts_2);
+            if (i == 3) ts = id(g_ts_3);
+            if (i == 4) ts = id(g_ts_4);
+            if (i == 5) ts = id(g_ts_5);
+            char buf[72];
+            if (n < 1 || sym.empty()) {
+              lv_label_set_text(id(lbl_name), "");
+            } else {
+              if (!name.empty()) lv_label_set_text(id(lbl_name), name.c_str());
+            }
+            if (n < 1 || price <= 0.0f) {
+              lv_label_set_text(id(lbl_price), "");
+              lv_label_set_text(id(lbl_chg), "");
+            } else {
+              snprintf(buf, sizeof(buf), "%.2f", price);
+              lv_label_set_text(id(lbl_price), buf);
+              snprintf(buf, sizeof(buf), "%+.2f   %+.2f%%", chg, pct);
+              lv_label_set_text(id(lbl_chg), buf);
+            }
+            lv_color_t col = lv_color_hex(0xEF5D5D);
+            if (chg >= 0.0f) col = lv_color_hex(0x3DCF8E);
+            lv_obj_set_style_text_color(id(lbl_chg), col, LV_PART_MAIN);
+            if (hi > 0.0f && lo > 0.0f) snprintf(buf, sizeof(buf), "%.2f-%.2f", lo, hi);
+            else snprintf(buf, sizeof(buf), " ");
+            lv_label_set_text(id(lbl_hl), buf);
+            if(id(g_show_value)) {
+              float sh_whole = (float) (int) (sh + 0.0001f);
+              bool whole = (sh - sh_whole) < 0.0001f && (sh_whole - sh) < 0.0001f;
+              if (whole) {
+                if (sh > 0 && price > 0) {
+                  if (sh == 1) snprintf(buf, sizeof(buf), "%.0f share", sh);
+                  else snprintf(buf, sizeof(buf), "%.0f shares", sh);
+                } else snprintf(buf, sizeof(buf), " ");
+              } else snprintf(buf, sizeof(buf), "%.2f shares", sh);
+              lv_label_set_text(id(lbl_qty), buf);
+              float usd_value = price * sh;
+              if (n < 1 || sh <=0 || price <= 0.0f) {
+                lv_label_set_text(id(lbl_value), "");
+              } else if (id(g_currency_code) == "USD" || id(g_fx_rate) <= 0.0f) {
+                if (usd_value < 100000.0f) snprintf(buf, sizeof(buf), "$%.2f", usd_value);
+                else if (usd_value < 1000000.0f) snprintf(buf, sizeof(buf), "$%.2fk", usd_value / 1000.0f);
+                else snprintf(buf, sizeof(buf), "$%.2fM", usd_value / 1000000.0f);
+                lv_label_set_text(id(lbl_value), buf);
+              } else {
+                float cv = usd_value * id(g_fx_rate);
+                char cur[32];
+                if (cv < 100000.0f) snprintf(cur, sizeof(cur), "%.2f", cv);
+                else if (cv < 1000000.0f) snprintf(cur, sizeof(cur), "%.2fk", cv / 1000.0f);
+                else snprintf(cur, sizeof(cur), "%.2fM", cv / 1000000.0f);
+                //for (char *pc = cur; *pc; pc++) if (*pc == '.') *pc = ',';
+                const char *cs = id(g_currency_symbol).empty() ? id(g_currency_code).c_str() : id(g_currency_symbol).c_str();
+                if (usd_value < 100000.0f) snprintf(buf, sizeof(buf), "$%.2f %s%s", usd_value, cur, cs);
+                else if (usd_value < 1000000.0f) snprintf(buf, sizeof(buf), "$%.2fk %s%s", usd_value / 1000.0f, cur, cs);
+                else snprintf(buf, sizeof(buf), "$%.2fM %s%s", usd_value / 1000000.0f, cur, cs);
+                lv_label_set_text(id(lbl_value), buf);
+              }
+            } else {
+              lv_label_set_text(id(lbl_value), "");
+              lv_label_set_text(id(lbl_qty), "");
+            }  
+            if (ts > 0) {
+              time_t tt = (time_t) ts;
+              struct tm tmv;
+              localtime_r(&tt, &tmv);
+              time_t nowt = ::time(nullptr);
+              int age = (int) (nowt - tt);
+              if (age < 0) age = 0;
+              char rel[24];
+              if (nowt < 100000) rel[0] = '\0';
+              else if (age < 60) snprintf(rel, sizeof(rel), "%d sec", age);
+              else if (age < 3600) snprintf(rel, sizeof(rel), "%d min", age / 60);
+              else if (age < 86400) snprintf(rel, sizeof(rel), "%d hour", age / 3600);
+              else snprintf(rel, sizeof(rel), "%d day", age / 86400);
+              snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d %s", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, rel);
+              lv_label_set_text(id(lbl_when), buf);
+            } else {
+              lv_label_set_text(id(lbl_when), "");
+            }
+            bool open = id(g_market_open);
+            if (open) {
+              lv_label_set_text(id(lbl_status), "OPEN");
+              lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x3DCF8E), LV_PART_MAIN);
+              lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x3DCF8E), LV_PART_MAIN);
+              lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x10261C), LV_PART_MAIN);
+              
+            } else {
+              bool pre=id(g_premarket);
+              bool after=id(g_aftermarket);
+              if (pre) { 
+                lv_label_set_text(id(lbl_status), "PRE-MARKET");
+                lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x6FC7FF), LV_PART_MAIN);
+                //lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x2D6F9A), LV_PART_MAIN);
+                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x0D1C26), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x0D1C26), LV_PART_MAIN);
+              } else if (after) {
+                lv_label_set_text(id(lbl_status), "AFTER HOURS");
+                lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xC58CFF), LV_PART_MAIN);
+                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x6E4A91), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x1B1224), LV_PART_MAIN);
+              } else {
+                lv_label_set_text(id(lbl_status), "CLOSED");
+                lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x8A8780), LV_PART_MAIN);
+                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x3A3A34), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x141412), LV_PART_MAIN);
+              }
+            }
+            lv_obj_t *tickers[6] = { id(dot_0), id(dot_1), id(dot_2), id(dot_3), id(dot_4), id(dot_5) };
+            const char *syms[6] = { id(g_sym_0).c_str(), id(g_sym_1).c_str(), id(g_sym_2).c_str(), 
+                                    id(g_sym_3).c_str(), id(g_sym_4).c_str(), id(g_sym_5).c_str() };
+            float chgs[6] = { id(g_chg_0), id(g_chg_1), id(g_chg_2), id(g_chg_3), id(g_chg_4), id(g_chg_5) };
+            float prcs[6] = { id(g_price_0), id(g_price_1), id(g_price_2), id(g_price_3), id(g_price_4), id(g_price_5) };
+            bool loads[6] = { id(g_loaded_0), id(g_loaded_1), id(g_loaded_2), id(g_loaded_3), id(g_loaded_4), id(g_loaded_5) };
+            const int cell_w = 80;
+            const int start_x = (480 - n * cell_w) / 2;
+            for (int d = 0; d < 6; d++) {
+              if (n < 1 || d >= n || syms[d][0] == '\0') {
+                lv_obj_add_flag(tickers[d], LV_OBJ_FLAG_HIDDEN);
+              } else {
+                lv_obj_clear_flag(tickers[d], LV_OBJ_FLAG_HIDDEN);
+                lv_label_set_text(tickers[d], syms[d]);
+                lv_obj_set_pos(tickers[d], start_x + d * cell_w, 456);
+                lv_obj_set_width(tickers[d], cell_w);
+                lv_obj_set_height(tickers[d], 28);
+                lv_obj_set_style_text_align(tickers[d], LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+                lv_color_t bright,dim;
+                //ESP_LOGD("paint_active","**************  %d. loaded: %s show: %s **************",d,loads[d] ? "Yes": "No",id(g_show_value) ? "Yes" : "No");
+                if(loads[d]) {
+                  bool up = chgs[d] >= 0.0f;
+                  bright = up ? lv_color_hex(0x3DCF8E) : lv_color_hex(0xEF5D5D);
+                  dim = up ? lv_color_hex(0x267A58) : lv_color_hex(0x8F3838);
+                  //if(i == d) lv_obj_clear_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);                  
+                } else {
+                  bright = lv_color_hex(777777);
+                  dim = lv_color_hex(0x444444);
+                  //if(i == d) lv_obj_add_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);                  
+                }  
+                lv_obj_set_style_text_color(tickers[d], d == i ? bright : dim, LV_PART_MAIN);
+              }
+            }
+            const int width = 480;
+            int height = 196;
+            if (id(g_show_value) && sh > 0) height = 86;
+
+            // g_spark format: day_seconds|close,day_seconds|close,...
+            // day_seconds = local seconds from 00:00.
+            // 5-minute Yahoo data: pre=66, regular=78, regular+after=126.
+            const int MAX_POINTS = 128;
+            int day_seconds[MAX_POINTS];
+            float vals[MAX_POINTS];
+            int vn = 0;
+            size_t sp = 0;
+
+            while (sp < spark.size() && vn < MAX_POINTS) {
+              while (sp < spark.size() && (spark[sp] == ' ' || spark[sp] == ',' || spark[sp] == '\n' || spark[sp] == '\r')) {
+                sp++;
+              }
+              if (sp >= spark.size()) break;
+              char *end = nullptr;
+              long day_sec = strtol(spark.c_str() + sp, &end, 10);
+              if (end == spark.c_str() + sp) break;
+              sp = (size_t)(end - spark.c_str());
+              if (sp >= spark.size() || spark[sp] != '|') break;
+              sp++;
+              float value = strtof(spark.c_str() + sp, &end);
+              if (end == spark.c_str() + sp) break;
+              sp = (size_t)(end - spark.c_str());
+              if (day_sec < 0 || day_sec > 24 * 60 * 60 || value <= 0.0f) continue;
+              day_seconds[vn] = (int)day_sec;
+              vals[vn] = value;
+              vn++;
+            }
+
+            //ESP_LOGD("paint_active","values: %d",vn);
+            
+            #if LVGL_VERSION_MAJOR >= 9
+            static lv_point_precise_t pts[MAX_POINTS];
+            static lv_point_precise_t prev_pts[2];
+            static lv_point_precise_t session_pts[2];
+            #else
+            static lv_point_t pts[MAX_POINTS];
+            static lv_point_t prev_pts[2];
+            static lv_point_t session_pts[2];
+            #endif
+
+            int pn = vn;
+
+            if (pn == 0) {
+              lv_obj_add_flag(id(spark_line)->obj, LV_OBJ_FLAG_HIDDEN);
+              lv_obj_add_flag(id(prev_close_line)->obj, LV_OBJ_FLAG_HIDDEN);
+              lv_obj_add_flag(id(session_separator)->obj, LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_obj_clear_flag(id(spark_line)->obj, LV_OBJ_FLAG_HIDDEN);
+
+              float mn = vals[0];
+              float mx = vals[0];
+
+              for (int k = 1; k < pn; k++) {
+                if (vals[k] < mn) mn = vals[k];
+                if (vals[k] > mx) mx = vals[k];
+              }
+
+              float prev_close = price - chg;
+              if (prev_close > 0.0f) {
+                if (prev_close < mn) mn = prev_close;
+                if (prev_close > mx) mx = prev_close;
+              }
+
+              float span = mx - mn;
+              if (span < 0.0001f)
+                span = 1.0f;
+
+              // --------------------------------------------------
+              // time scale
+              // PRE:     04:00 -> 09:30
+              // OPEN:    09:30 -> 16:00
+              // AFTER:   09:30 -> 20:00
+              // CLOSED:  09:30 -> 16:00 
+              // --------------------------------------------------
+
+              int start_minutes = 9 * 60 + 30;
+              int end_minutes   = 16 * 60;
+
+              bool pre = id(g_premarket);
+              bool after = id(g_aftermarket);
+
+              if (pre) {
+                start_minutes = 4 * 60;
+                end_minutes = 9 * 60 + 30;
+              } else if (after) {
+                start_minutes = 9 * 60 + 30;
+                end_minutes = 20 * 60;
+              }
+
+              int start_seconds = start_minutes * 60;
+              int end_seconds = end_minutes * 60;
+              int total_seconds = end_seconds - start_seconds;
+              if (total_seconds <= 0) total_seconds = 60;
+
+              //ESP_LOGD("paint_active","start min: %d end min: %d",start_minutes,end_minutes);
+              // --------------------------------------------------
+              // Graph points
+              // --------------------------------------------------
+
+              for (int k = 0; k < pn; k++) {
+
+                float xratio =
+                  (float)(day_seconds[k] - start_seconds) /
+                  (float)total_seconds;
+
+                if (xratio < 0.0f) xratio = 0.0f;
+                if (xratio > 1.0f) xratio = 1.0f;
+
+                int x = (int)(xratio * width);
+
+                float t =
+                  (vals[k] - mn) / span;
+
+                int y =
+                  (int)(4 + (1.0f - t) * height);
+
+                if (y < 0) y = 0;
+                if (y > height + 4) y = height + 4;
+
+                //ESP_LOGD("paint_active","time: %.0f, value: %.2f  --->  x: %d, y: %d",((float)day_seconds[k]/60.0f),vals[k],x,y);
+                pts[k].x = (lv_coord_t)x;
+                pts[k].y = (lv_coord_t)y;
+              }
+
+              lv_line_set_points(
+                id(spark_line).obj,
+                pts,
+                (uint32_t)pn
+              );
+
+              lv_obj_set_style_line_color(
+                id(spark_line).obj,
+                col,
+                LV_PART_MAIN
+              );
+
+              lv_obj_invalidate(id(spark_line).obj);
+
+              // --------------------------------------------------
+              // Previous-day closing price horizontal line
+              // --------------------------------------------------
+
+              if (prev_close > 0.0f) {
+
+                float prev_t =
+                  (prev_close - mn) / span;
+
+                int prev_y =
+                  (int)(4 + (1.0f - prev_t) * height);
+
+                prev_pts[0].x = 0;
+                prev_pts[0].y = prev_y;
+
+                prev_pts[1].x = width;
+                prev_pts[1].y = prev_y;
+
+                lv_line_set_points(
+                  id(prev_close_line).obj,
+                  prev_pts,
+                  2
+                );
+
+                lv_obj_clear_flag(
+                  id(prev_close_line).obj,
+                  LV_OBJ_FLAG_HIDDEN
+                );
+
+                lv_obj_set_style_line_color(
+                  id(prev_close_line).obj,
+                  lv_color_hex(0x666666),
+                  LV_PART_MAIN
+                );
+
+                lv_obj_invalidate(
+                  id(prev_close_line).obj
+                );
+
+              } else {
+
+                lv_obj_add_flag(
+                  id(prev_close_line).obj,
+                  LV_OBJ_FLAG_HIDDEN
+                );
+              }
+
+              // --------------------------------------------------
+              // 16:00 vertical separator
+              // Only in AFTER HOURS mode
+              // --------------------------------------------------
+
+              if (after) {
+
+                float separator_ratio =
+                  (float)((16 * 60) - (9 * 60 + 30)) /
+                  (float)((20 * 60) - (9 * 60 + 30));
+
+                int separator_x =
+                  (int)(separator_ratio * width);
+
+                session_pts[0].x = separator_x;
+                session_pts[0].y = 0;
+
+                session_pts[1].x = separator_x;
+                session_pts[1].y = height + 4;
+
+                lv_line_set_points(
+                  id(session_separator).obj,
+                  session_pts,
+                  2
+                );
+
+                lv_obj_clear_flag(
+                  id(session_separator).obj,
+                  LV_OBJ_FLAG_HIDDEN
+                );
+
+                lv_obj_set_style_line_color(
+                  id(session_separator).obj,
+                  lv_color_hex(0x555555),
+                  LV_PART_MAIN
+                );
+
+                lv_obj_invalidate(
+                  id(session_separator).obj
+                );
+
+              } else {
+
+                lv_obj_add_flag(
+                  id(session_separator).obj,
+                  LV_OBJ_FLAG_HIDDEN
+                );
+              }
+            }
+  - id: paint_session
+    then:
+      - lambda: |-
+            auto t = id(sntp_time).now();
+            bool open = false, pre = false, after = false;
+            if (t.is_valid()) {
+              int wd = t.day_of_week;
+              if (wd >= 2 && wd <= 6) {
+                char ymd[16];
+                snprintf(ymd, sizeof(ymd), "%04d-%02d-%02d", t.year, t.month, t.day_of_month);
+                bool holiday = false;
+                static const char *holidays[] = {
+                  "2025-01-01",
+                  "2025-01-20",
+                  "2025-02-17",
+                  "2025-04-18",
+                  "2025-05-26",
+                  "2025-06-19",
+                  "2025-07-04",
+                  "2025-09-01",
+                  "2025-11-27",
+                  "2025-12-25",
+                  "2026-01-01",
+                  "2026-01-19",
+                  "2026-02-16",
+                  "2026-04-03",
+                  "2026-05-25",
+                  "2026-06-19",
+                  "2026-07-03",
+                  "2026-09-07",
+                  "2026-11-26",
+                  "2026-12-25",
+                  "2027-01-01",
+                  "2027-01-18",
+                  "2027-02-15",
+                  "2027-03-26",
+                  "2027-05-31",
+                  "2027-06-18",
+                  "2027-07-05",
+                  "2027-09-06",
+                  "2027-11-25",
+                  "2027-12-24"
+                };
+                for (int hi = 0; hi < (int) (sizeof(holidays) / sizeof(holidays[0])); hi++) {
+                  if (strcmp(ymd, holidays[hi]) == 0) holiday = true;
+                }
+                if (!holiday) {
+                  int close_m = 16 * 60;
+                  static const char *early[] = {
+                  "2025-07-03",
+                  "2025-11-28",
+                  "2025-12-24",
+                  "2026-11-27",
+                  "2026-12-24",
+                  "2027-11-26"
+                  };
+                  for (int ei = 0; ei < (int) (sizeof(early) / sizeof(early[0])); ei++) {
+                    if (strcmp(ymd, early[ei]) == 0) close_m = 13 * 60;
+                  }
+                  int mins = t.hour * 60 + t.minute;
+                  open = mins >= 9 * 60 + 30 && mins < close_m;
+                  pre = mins >= 4 * 60 && mins < 9 * 60 + 30;
+                  after = mins < 20 * 60 && mins >= close_m;
+                }
+              }
+            }
+            id(g_market_open) = open;
+            id(g_premarket) = pre;
+            id(g_aftermarket) = after;
+      - script.execute: paint_active
+  - id: fetch_one
+    mode: queued
+    parameters:
+      slot: int
+    then:
+      - lambda: |-
+            id(g_fetch_i) = slot;
+      - if:
+          condition:
+            lambda: |-
+                int i = id(g_fetch_i);
+                if (i < 0 || i >= id(g_count)) return false;
+                std::string sym = id(g_sym_0);
+                if (i == 1) sym = id(g_sym_1);
+                if (i == 2) sym = id(g_sym_2);
+                if (i == 3) sym = id(g_sym_3);
+                if (i == 4) sym = id(g_sym_4);
+                if (i == 5) sym = id(g_sym_5);
+                return !sym.empty();
+          then:
+            - http_request.get:
+                url: !lambda |-
+                    int i = id(g_fetch_i);
+                    std::string sym = id(g_sym_0);
+                    if (i == 1) sym = id(g_sym_1);
+                    if (i == 2) sym = id(g_sym_2);
+                    if (i == 3) sym = id(g_sym_3);
+                    if (i == 4) sym = id(g_sym_4);
+                    if (i == 5) sym = id(g_sym_5);
+                    return std::string("https://query1.finance.yahoo.com/v8/finance/chart/") + sym + "?range=1d&interval=5m&includePrePost=true";
+                capture_response: true
+                max_response_buffer_size: 20480
+                on_response:
+                  then:
+                    - if:
+                        condition:
+                          lambda: return response->status_code == 200;
+                        then:
+                          - lambda: |-
+                              std::string spark;
+                              bool parsed = json::parse_json(body, [&spark](JsonObject root) -> bool {
+                                int i = id(g_fetch_i); std::string sym;
+                                JsonVariant meta = root["chart"]["result"][0]["meta"];
+                                if (meta.isNull() ||
+                                    (meta["regularMarketPrice"].isNull() &&
+                                     meta["fulldayPrice"].isNull())) {
+                                  //lv_obj_clear_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);
+                                  if (i == 0) {
+                                    id(g_price_0) = 0; id(g_chg_0) = 0; id(g_pct_0) = 0; id(g_hi_0) = 0; id(g_lo_0) = 0; id(g_ts_0) = 0; id(g_loaded_0) = false;
+                                    sym = id(g_sym_0); id(g_name_0) = sym;
+                                  }                                
+                                  if (i == 1) {
+                                    id(g_price_1) = 0; id(g_chg_1) = 0; id(g_pct_1) = 0; id(g_hi_1) = 0; id(g_lo_1) = 0; id(g_ts_1) = 0; id(g_loaded_1) = false;
+                                    sym = id(g_sym_1); id(g_name_1) = sym;
+                                  }                                
+                                  if (i == 2) {
+                                    id(g_price_2) = 0; id(g_chg_2) = 0; id(g_pct_2) = 0; id(g_hi_2) = 0; id(g_lo_2) = 0; id(g_ts_2) = 0; id(g_loaded_2) = false;
+                                    sym = id(g_sym_2); id(g_name_2) = sym;
+                                  }                                
+                                  if (i == 3) {
+                                    id(g_price_3) = 0; id(g_chg_3) = 0; id(g_pct_3) = 0; id(g_hi_3) = 0; id(g_lo_3) = 0; id(g_ts_3) = 0; id(g_loaded_3) = false;
+                                    sym = id(g_sym_3); id(g_name_3) = sym;
+                                  }                                
+                                  if (i == 4) {
+                                    id(g_price_4) = 0; id(g_chg_4) = 0; id(g_pct_4) = 0; id(g_hi_4) = 0; id(g_lo_4) = 0; id(g_ts_4) = 0; id(g_loaded_4) = false;
+                                    sym = id(g_sym_4); id(g_name_4) = sym;
+                                  }                                
+                                  if (i == 5) {
+                                    id(g_price_5) = 0; id(g_chg_5) = 0; id(g_pct_5) = 0; id(g_hi_5) = 0; id(g_lo_5) = 0; id(g_ts_5) = 0; id(g_loaded_5) = false; 
+                                    sym = id(g_sym_5); id(g_name_5) = sym;
+                                  }    
+                                  ESP_LOGD("fetch_one","************** ticker: %s, FAILED **************",sym.c_str());
+                                  return false;
+                                }
+                                bool preaft=id(g_premarket) || id(g_aftermarket);
+                                bool open=id(g_market_open);
+                                float price = meta["regularMarketPrice"].as<float>();
+                                float pricef = meta["fulldayPrice"].as<float>();
+                                if(preaft) price=pricef;
+                                float prev = price;
+                                if (!meta["chartPreviousClose"].isNull()) prev = meta["chartPreviousClose"].as<float>();
+                                else if (!meta["previousClose"].isNull()) prev = meta["previousClose"].as<float>();
+                                float hi = 0.0f;
+                                float lo = 0.0f;
+                                if (!meta["regularMarketDayHigh"].isNull()) hi = meta["regularMarketDayHigh"].as<float>();
+                                if (!meta["regularMarketDayLow"].isNull()) lo = meta["regularMarketDayLow"].as<float>();
+                                int ts = 0;
+                                if (preaft) {
+                                  JsonArray timestamps = root["chart"]["result"][0]["timestamp"].as<JsonArray>();
+                                  if (!timestamps.isNull() && timestamps.size() > 0) {
+                                    ts = timestamps[timestamps.size() - 1].as<int>();
+                                  }
+                                } else if (!meta["regularMarketTime"].isNull()) {
+                                  ts = (int) meta["regularMarketTime"].as<long>();
+                                }                                
+                                std::string name;
+                                if (meta["shortName"].is<const char *>()) name = std::string(meta["shortName"].as<const char *>());
+                                float chg;
+                                if (preaft && !meta["fulldayChange"].isNull()) chg=meta["fulldayChange"].as<float>();
+                                else chg = price - prev;
+                                float pct = 0.0f;
+                                if (prev != 0.0f) pct = chg * 100.0f / prev;
+                                lv_obj_add_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);
+                                lv_obj_clear_flag(id(status_box), LV_OBJ_FLAG_HIDDEN);
+                                if (i == 0) {
+                                  id(g_price_0) = price;
+                                  id(g_chg_0) = chg;
+                                  id(g_pct_0) = pct;
+                                  id(g_hi_0) = hi;
+                                  id(g_lo_0) = lo;
+                                  id(g_ts_0) = ts;
+                                  id(g_loaded_0) = true;
+                                  if (name.empty()) id(g_name_0) = id(g_sym_0);
+                                  else id(g_name_0) = name;
+                                }
+                                if (i == 1) {
+                                  id(g_price_1) = price;
+                                  id(g_chg_1) = chg;
+                                  id(g_pct_1) = pct;
+                                  id(g_hi_1) = hi;
+                                  id(g_lo_1) = lo;
+                                  id(g_ts_1) = ts;
+                                  id(g_loaded_1) = true;
+                                  if (name.empty()) id(g_name_1) = id(g_sym_1);
+                                  else id(g_name_1) = name;
+                                }
+                                if (i == 2) {
+                                  id(g_price_2) = price;
+                                  id(g_chg_2) = chg;
+                                  id(g_pct_2) = pct;
+                                  id(g_hi_2) = hi;
+                                  id(g_lo_2) = lo;
+                                  id(g_ts_2) = ts;
+                                  id(g_loaded_2) = true;
+                                  if (name.empty()) id(g_name_2) = id(g_sym_2);
+                                  else id(g_name_2) = name;
+                                }
+                                if (i == 3) {
+                                  id(g_price_3) = price;
+                                  id(g_chg_3) = chg;
+                                  id(g_pct_3) = pct;
+                                  id(g_hi_3) = hi;
+                                  id(g_lo_3) = lo;
+                                  id(g_ts_3) = ts;
+                                  id(g_loaded_3) = true;
+                                  if (name.empty()) id(g_name_3) = id(g_sym_3);
+                                  else id(g_name_3) = name;
+                                }
+                                if (i == 4) {
+                                  id(g_price_4) = price;
+                                  id(g_chg_4) = chg;
+                                  id(g_pct_4) = pct;
+                                  id(g_hi_4) = hi;
+                                  id(g_lo_4) = lo;
+                                  id(g_ts_4) = ts;
+                                  id(g_loaded_4) = true;
+                                  if (name.empty()) id(g_name_4) = id(g_sym_4);
+                                  else id(g_name_4) = name;
+                                }
+                                if (i == 5) {
+                                  id(g_price_5) = price;
+                                  id(g_chg_5) = chg;
+                                  id(g_pct_5) = pct;
+                                  id(g_hi_5) = hi;
+                                  id(g_lo_5) = lo;
+                                  id(g_ts_5) = ts;
+                                  id(g_loaded_5) = true;
+                                  if (name.empty()) id(g_name_5) = id(g_sym_5);
+                                  else id(g_name_5) = name;
+                                }
+                                JsonArray timestamps =
+                                  root["chart"]["result"][0]["timestamp"].as<JsonArray>();
+
+                                JsonArray closes =
+                                  root["chart"]["result"][0]["indicators"]["quote"][0]["close"].as<JsonArray>();
+
+                                if (!timestamps.isNull() && !closes.isNull()) {
+                                  size_t count = timestamps.size();
+                                  if (closes.size() < count) count = closes.size();
+
+                                  for (size_t k = 0; k < count; k++) {
+                                    if (timestamps[k].isNull() || closes[k].isNull()) continue;
+
+                                    int tstamp = timestamps[k].as<int>();
+                                    float close_value = closes[k].as<float>();
+
+                                    if (tstamp <= 0 || close_value <= 0.0f) continue;
+
+                                    time_t tt = (time_t)tstamp;
+                                    struct tm tmv;
+                                    localtime_r(&tt, &tmv);
+
+                                    int minutes = tmv.tm_hour * 60 + tmv.tm_min;
+                                    int seconds = tmv.tm_hour * 3600 + tmv.tm_min * 60 + tmv.tm_sec;
+
+                                    bool keep = false;
+
+                                    if (preaft && id(g_premarket)) {
+                                      // 04:00 - 09:30
+                                      keep = minutes >= 4 * 60 && minutes < 9 * 60 + 30;
+                                    } else if (open) {
+                                      // 09:30 - 16:00
+                                      keep = minutes >= 9 * 60 + 30 && minutes < 16 * 60;
+                                    } else if (preaft && id(g_aftermarket)) {
+                                      // Regular + after-hours: 09:30 - 20:00
+                                      keep = minutes >= 9 * 60 + 30 && minutes < 20 * 60;
+                                    } else {
+                                      // CLOSED: last regular session
+                                      keep = minutes >= 9 * 60 + 30 && minutes < 16 * 60;
+                                    }
+
+                                    if (!keep) continue;
+                                    //ESP_LOGD("fetch_one","minutes: %d",minutes);
+                                    char item[40];
+                                    snprintf(item, sizeof(item), "%d|%.4f", seconds, close_value);
+
+                                    if (!spark.empty()) spark.push_back(',');
+                                    spark += item;
+                                  }
+                                }
+
+                                if (!spark.empty()) {
+                                  if (i == 0) id(g_spark_0) = spark;
+                                  if (i == 1) id(g_spark_1) = spark;
+                                  if (i == 2) id(g_spark_2) = spark;
+                                  if (i == 3) id(g_spark_3) = spark;
+                                  if (i == 4) id(g_spark_4) = spark;
+                                  if (i == 5) id(g_spark_5) = spark;
+                                }                                
+                                //ESP_LOGD("fetch_one","ticker: %s  ts, close values length: %d",sym.c_str(),spark.length());
+                                //size_t chunk_size = 100;
+                                //for (size_t i = 0; i < spark.length(); i += chunk_size) {
+                                //    std::string chunk = spark.substr(i, chunk_size);
+                                //    ESP_LOGD("fetch_one", "  Részlet [%d-%d]: %s", i, i + chunk.length(), chunk.c_str());
+                                //}
+                                return true;
+                              });
+                              int i = id(g_fetch_i);
+
+                              if (spark.empty() && parsed) {
+                                float price = id(g_price_0);
+                                int ts = id(g_ts_0);
+                                if (i == 1) { price = id(g_price_1); ts = id(g_ts_1); }
+                                if (i == 2) { price = id(g_price_2); ts = id(g_ts_2); }
+                                if (i == 3) { price = id(g_price_3); ts = id(g_ts_3); }
+                                if (i == 4) { price = id(g_price_4); ts = id(g_ts_4); }
+                                if (i == 5) { price = id(g_price_5); ts = id(g_ts_5); }
+                                if (price > 0.0f && ts > 0) {
+                                  time_t tt = (time_t)ts;
+                                  struct tm tmv;
+                                  localtime_r(&tt, &tmv);
+                                  int seconds = tmv.tm_hour * 3600 + tmv.tm_min * 60 + tmv.tm_sec;
+                                  char b[48];
+                                  snprintf(b, sizeof(b), "%d|%.4f", seconds, price);
+                                  spark = b;
+                                }
+                              }
+                              if (!spark.empty()) {
+                                if (i == 0) id(g_spark_0) = spark;
+                                if (i == 1) id(g_spark_1) = spark;
+                                if (i == 2) id(g_spark_2) = spark;
+                                if (i == 3) id(g_spark_3) = spark;
+                                if (i == 4) id(g_spark_4) = spark;
+                                if (i == 5) id(g_spark_5) = spark;
+                              }
+                          - script.execute: paint_active
+
+                        else:
+                          - logger.log:
+                              format: "Ticker HTTP %d"
+                              args: ["response->status_code"]
+  - id: fetch_currency
+    mode: restart
+    then:
+      - http_request.get:
+          url: !lambda |-
+            std::string cc = id(g_currency_code);
+            if (cc.empty() || cc == "USD") return std::string("https://api.frankfurter.dev/v2/rates?base=usd&quotes=usd");
+            return std::string("https://api.frankfurter.dev/v2/rates?base=usd&quotes=") + cc;
+          capture_response: true
+          max_response_buffer_size: 8192
+          on_response:
+            then:
+              - lambda: |-
+                  id(g_fx_loaded) = false;
+                  std::string cc = id(g_currency_code);
+                  if (response->status_code == 200) {
+                    size_t rp = body.find("\"rate\":");
+                    if (rp != std::string::npos) {
+                      rp += 7;
+                      char *end = nullptr;
+                      float rate = strtof(body.c_str() + rp, &end);
+                      ESP_LOGD("fetch_currency","************** currency: %s, rate: %.2f **************",cc.c_str(),rate);                          
+                      if (end != body.c_str() + rp && rate > 0.0f) {
+                        id(g_fx_rate) = rate;
+                        id(g_fx_loaded) = true;
+                        //ESP_LOGD("fetch_currency","************** currency: %s, loaded **************",cc.c_str());                          
+                      } else {
+                        ESP_LOGD("fetch_currency","************** currency: %s, NOT LOADED **************",cc.c_str());
+                      }
+                    }
+                  } else {
+                    ESP_LOGD("fetch_currency","************** currency: %s, FAILED **************",cc.c_str());
+                  }  
+      - http_request.get:
+          url: "https://api.frankfurter.dev/v2/currencies"
+          capture_response: true
+          max_response_buffer_size: 32768
+          on_response:
+            then:
+              - lambda: |-
+                  id(g_currency_symbol) = id(g_currency_code) == "USD" ? "$" : id(g_currency_code);
+                  if (response->status_code == 200 && !body.empty()) {
+                    std::string code = id(g_currency_code);
+                    std::string needle = std::string("\"iso_code\":\"") + code + "\"";
+                    size_t p = body.find(needle);
+                    if (p != std::string::npos) {
+                      size_t sp = body.find("\"symbol\":\"", p);
+                      if (sp != std::string::npos) {
+                        sp += 10;
+                        size_t ep = body.find("\"", sp);
+                        if (ep != std::string::npos && ep > sp) id(g_currency_symbol) = body.substr(sp, ep - sp);
+                      }
+                    }
+                  }
+              - script.execute: paint_active
+  - id: fetch_all
+    mode: single
+    then:
+      - delay: 2000ms
+      - script.execute:
+          id: fetch_one
+          slot: 0
+      - script.wait: fetch_one
+      - delay: 1000ms
+      - script.execute:
+          id: fetch_one
+          slot: 1
+      - script.wait: fetch_one
+      - delay: 1000ms
+      - script.execute:
+          id: fetch_one
+          slot: 2
+      - script.wait: fetch_one
+      - delay: 1000ms
+      - script.execute:
+          id: fetch_one
+          slot: 3
+      - script.wait: fetch_one
+      - delay: 1000ms
+      - script.execute:
+          id: fetch_one
+          slot: 4
+      - script.wait: fetch_one
+      - delay: 1000ms
+      - script.execute:
+          id: fetch_one
+          slot: 5
+      - script.wait: fetch_one
+
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          //if (!id(page_info).is_visible()) {            return;          }
+          // ------------------------------------------------------------
+          // SYSTEM INFO 1s
+          // ------------------------------------------------------------
+          char b[160];
+          auto t = id(sntp_time).now();
+
+          // PSRAM: free / total
+          uint32_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+          uint32_t psram_total = esp_psram_get_size();
+          snprintf(b, sizeof(b), "%lu/%lu kB",
+                   (unsigned long)(psram_free / 1024UL),
+                   (unsigned long)(psram_total / 1024UL));
+          lv_label_set_text(id(info_psram), b);
+
+          // Free heap
+          uint32_t heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+          snprintf(b, sizeof(b), "%lu kB", (unsigned long)(heap / 1024UL));
+          lv_label_set_text(id(info_heap), b);
+
+          float rssi = id(wifi_signal_db).state;
+          if (isnan(rssi)) snprintf(b, sizeof(b), "--");
+          else snprintf(b, sizeof(b), "%.0f dBm", rssi);
+          lv_label_set_text(id(info_rssi), b);
+
+          // Uptime
+          uint32_t up = millis() / 1000UL;
+          uint32_t d = up / 86400UL;
+          uint32_t h = (up % 86400UL) / 3600UL;
+          uint32_t m = (up % 3600UL) / 60UL;
+          uint32_t sec = up % 60UL;
+          snprintf(b, sizeof(b), "%lu d %02lu:%02lu:%02lu",
+                   (unsigned long)d, (unsigned long)h,
+                   (unsigned long)m, (unsigned long)sec);
+          lv_label_set_text(id(info_uptime), b);
+
+          // Time is already in America/New_York (EST/EDT) through SNTP.
+          if (t.is_valid()) {
+            snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
+                     t.year, t.month, t.day_of_month,
+                     t.hour, t.minute, t.second);
+          } else {
+            snprintf(b, sizeof(b), "--:--:--");
+          }
+          lv_label_set_text(id(info_time), b);
+  - interval: 30s
+    then:
+      - lambda: |-
+          //if (!id(page_info).is_visible()) {return;}
+          // ------------------------------------------------------------
+          // SYSTEM INFO 30s
+          // ------------------------------------------------------------
+          char b[160];
+          auto t = id(sntp_time).now();
+          
+          // ESP32-S3 internal temperature sensor is exposed by ESPHome.
+          float cpu_temp = id(cpu_temperature).state;
+          if (isnan(cpu_temp)) snprintf(b, sizeof(b), "--");
+          else snprintf(b, sizeof(b), "%.1f °C", cpu_temp);
+          lv_label_set_text(id(info_cpu_temp), b);
+  - interval: 3600s
+    then:
+      - lambda: |-
+          //if (!id(page_info).is_visible()) {            return;          }
+          // ------------------------------------------------------------
+          // SYSTEM INFO 1h
+          // ------------------------------------------------------------
+          char b[160];
+
+          // Running application partition / sketch space.
+          const esp_partition_t *part = esp_ota_get_running_partition();
+          uint32_t image_size = 0;
+          uint32_t image_capacity = 0;
+          if (part != nullptr) {
+            image_capacity = part->size;
+            esp_image_header_t hdr{};
+            if (esp_partition_read(part, 0, &hdr, sizeof(hdr)) == ESP_OK &&
+                hdr.magic == ESP_IMAGE_HEADER_MAGIC) {
+              uint32_t off = sizeof(esp_image_header_t);
+              bool ok = true;
+              for (uint8_t si = 0; si < hdr.segment_count; si++) {
+                esp_image_segment_header_t sh{};
+                if (esp_partition_read(part, off, &sh, sizeof(sh)) != ESP_OK) {
+                  ok = false;
+                  break;
+                }
+                off += sizeof(esp_image_segment_header_t) + sh.data_len;
+              }
+              if (ok) {
+                // One checksum byte follows the last segment and the image
+                // is padded to a 16-byte boundary.
+                off += 1;
+                off = (off + 15U) & ~15U;
+                if (hdr.hash_appended) off += 32;
+                image_size = off;
+              }
+            }
+          }
+          if (image_size > 0 && image_capacity > 0) {
+            uint32_t used_kb = (image_size + 1023UL) / 1024UL;
+            uint32_t cap_kb = image_capacity / 1024UL;
+            //uint32_t pct = (used_kb * 100UL) / cap_kb;
+            snprintf(b, sizeof(b), "%lu/%lu kB",                       // (%lu%%)",
+                     (unsigned long)used_kb, (unsigned long)cap_kb);  //,(unsigned long)pct);
+          } else {
+            snprintf(b, sizeof(b), "--");
+          }
+          lv_label_set_text(id(info_sketch), b);
+
+          // WiFi
+          std::string ssid = id(wifi_ssid_info).state;
+          lv_label_set_text(id(info_ssid), ssid.empty() ? "" : ssid.c_str());
+
+          // WiFi channel
+          uint8_t wifi_channel = 0;
+          wifi_second_chan_t second_channel;
+          if (esp_wifi_get_channel(&wifi_channel, &second_channel) != ESP_OK) wifi_channel = 0;
+          if (wifi_channel > 0) snprintf(b, sizeof(b), "%u", (unsigned)wifi_channel);
+          else snprintf(b, sizeof(b), "--");
+          lv_label_set_text(id(info_channel), b);
+
+  - interval: ${poll_seconds}
+    then:
+      - script.execute: paint_session
+      - if:
+          condition:
+            lambda: return id(g_market_open) || id(g_premarket) || id(g_aftermarket);
+          then:
+#            - script.execute: fetch_all
+            - script.execute:
+                id: fetch_one
+                slot: id(g_index)
+
+lvgl:
+  displays:
+    - tft_display
+  touchscreens:
+    - tft_touch
+  color_depth: 16
+  buffer_size: 25%
+  page_wrap: false
+  pages:
+    - id: page_splash
+      bg_color: 0x000040
+      widgets:
+        - image:
+            src: img_applogo
+            x: 0
+            y: 0
+            width: 480
+            height: 480
+        - label:
+            id: app_version
+            text: "StoxBox "
+            text_font: font_value
+            text_color: 0xe0e0e0  
+            x: 20
+            y: 20
+            width: 240
+            hidden: true
+    - id: page_info
+      bg_color: 0x050504
+      on_swipe_up:
+        then:
+          - lambda: |-
+              //ESP_LOGD("page_info", "swipe up -> page_quote");
+              lv_indev_wait_release(lv_indev_get_act());
+          - lvgl.page.show:
+              id: page_quote
+              animation: OUT_TOP
+              time: 250ms
+      on_swipe_down:
+        then:
+          - lambda: |-
+              //ESP_LOGD("page_info", "swipe down -> page_setup");
+              lv_indev_wait_release(lv_indev_get_act());
+          - lvgl.page.show:
+              id: page_setup
+              animation: OUT_BOTTOM
+              time: 250ms
+      widgets:
+        - image:
+            src: img_infoback
+            x: 0
+            y: 0
+            width: 480
+            height: 480
+        - label:
+            text: "Version"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 4
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_version
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 4
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "Build"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 40
+            width: 100
+            height: 32
+#            long_mode: CLIP
+        - label:
+            id: info_build
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 110
+            y: 40
+            width: 360
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "CPU chip"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 76
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_cpu
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 76
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "CPU temp"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 112
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_cpu_temp
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 112
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "Flash size"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 148
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_flash
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 148
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "PSRAM"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 184
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_psram
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 184
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "Sketch space"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 220
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_sketch
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 220
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "Free heap"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 256
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_heap
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 256
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "SSID"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 292
+            width: 140
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_ssid
+            text: ""
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 150
+            y: 292
+            width: 320
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "RSSI"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 328
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_rssi
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 328
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "Channel"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 364
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_channel
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 364
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "Uptime"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 400
+            width: 140
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_uptime
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 150
+            y: 400
+            width: 320
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "Time (EST)"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 436
+            width: 145
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_time
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 155
+            y: 436
+            width: 315
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+    - id: page_quote
+      bg_color: 0x050504
+      on_swipe_left:
+        then:
+          - lambda: |-
+                lv_indev_wait_release(lv_indev_get_act());
+                int n = id(g_count);
+                if (n > 1) {
+                  int i = id(g_index) + 1;
+                  if (i >= n) i = 0;
+                  id(g_index) = i;
+                  lv_label_set_text(id(lbl_name), "");
+                }
+          - script.execute: paint_active
+      on_swipe_right:
+        then:
+          - lambda: |-
+                lv_indev_wait_release(lv_indev_get_act());
+                int n = id(g_count);
+                if (n > 1) {
+                  int i = id(g_index) - 1;
+                  if (i < 0) i = n - 1;
+                  id(g_index) = i;
+                  lv_label_set_text(id(lbl_name), "");
+                }
+          - script.execute: paint_active
+      on_swipe_up:
+        then:
+          - lambda: |-
+              //ESP_LOGD("keyboard_debug", "quote swipe_up: showing page_setup");
+              lv_indev_wait_release(lv_indev_get_act());
+          - lvgl.page.show:
+              id: page_setup
+              animation: OUT_TOP
+              time: 250ms
+      on_swipe_down:
+        then:
+          - lambda: "lv_indev_wait_release(lv_indev_get_act());"
+          - lvgl.page.show:
+              id: page_info
+              animation: OUT_BOTTOM
+              time: 250ms
+      on_double_click:
+        then:
+          - lambda: |-
+              id(g_show_value) = !id(g_show_value);
+              ESP_LOGD("double_click","show: %s",id(g_show_value) ? "Yes" : "No");
+          - script.execute: paint_active    
+      widgets:
+        - label:
+            id: lbl_loading
+            text: "LOADING..."
+            text_font: font_value
+            text_color: 0x8a8780
+            x: 0
+            y: 200
+            width: 480
+            height: 60
+            text_align: CENTER
+        - label:
+            id: lbl_name
+            text: ""
+            text_font: font_setup
+            text_color: 0xc8c4bc
+            long_mode: DOT
+            width: 320
+            x: 0
+            y: 4
+        - obj:
+            id: status_box
+            x: 320 
+            y: 4
+            width: 160
+            height: 40
+            radius: 10
+            bg_color: 0x10261c
+            border_width: 1
+            border_color: 0x3dcf8e
+            pad_all: 0
+            hidden: true
+            widgets:
+              - label:
+                  id: lbl_status
+                  text: "-----"
+                  text_font: font_ui
+                  text_color: 0x3dcf8e
+                  align: CENTER
+        - label:
+            id: lbl_price
+            text: ""
+            text_font: font_price
+            text_color: 0xf2efe8
+            width: 480
+            long_mode: CLIP
+            x: 0
+            y: 60
+        - label:
+            id: lbl_chg
+            text: ""
+            text_font: font_chg
+            text_color: 0x3dcf8e
+            width: 480
+            x: 0
+            y: 164
+        - label:
+            id: lbl_hl
+            text: "H  -      L  -"
+            text_font: font_chg
+            text_color: 0x8a8780
+            x: 240
+            y: 164 
+        - label:
+            id: lbl_when
+            text: ""
+            text_font: font_ui
+            text_color: 0x8a8780
+            x: 0
+            y: 210
+        - line:
+            id: session_separator
+            x: 0
+            y: 250
+            width: 480
+            height: 200
+            line_width: 1
+            line_rounded: false
+            line_color: 0x555555
+            points:
+              - 0, 0
+              - 0, 196        
+        - line:
+            id: prev_close_line
+            x: 0
+            y: 250
+            width: 480
+            height: 200
+            line_width: 1
+            line_rounded: false
+            line_color: 0x666666
+            points:
+              - 0, 0
+              - 464, 0                
+        - line:
+            id: spark_line
+            x: 0
+            y: 250
+            width: 480
+            height: 200
+            line_width: 3
+            line_rounded: true
+            line_color: 0x3dcf8e
+            points:
+              - 0, 32
+        - label:
+            id: lbl_qty
+            text: "0 share"
+            text_font: font_qty
+            text_color: 0x8a8780
+            x: 0
+            y: 362
+        - label:
+            id: lbl_value
+            text: " "
+            text_font: font_value
+            text_color: 0xd2cfc8
+            x: 0
+            y: 390
+        - label:
+            id: dot_0
+            text: ""
+            text_font: font_ui
+            text_color: 0x444444
+            width: 96
+            height: 28
+            x: 0
+            y: 456
+            text_align: CENTER
+        - label:
+            id: dot_1
+            text: ""
+            text_font: font_ui
+            text_color: 0x444444
+            width: 80
+            height: 28
+            x: 0
+            y: 456
+            text_align: CENTER
+        - label:
+            id: dot_2
+            text: ""
+            text_font: font_ui
+            text_color: 0x444444
+            width: 80
+            height: 28
+            x: 80
+            y: 456
+            text_align: CENTER
+        - label:
+            id: dot_3
+            text: ""
+            text_font: font_ui
+            text_color: 0x444444
+            width: 80
+            height: 28
+            x: 160
+            y: 456
+            text_align: CENTER
+        - label:
+            id: dot_4
+            text: ""
+            text_font: font_ui
+            text_color: 0x444444
+            width: 80
+            height: 28
+            x: 240
+            y: 456
+            text_align: CENTER
+        - label:
+            id: dot_5
+            text: ""
+            text_font: font_ui
+            text_color: 0x444444
+            width: 80
+            height: 28
+            x: 320
+            y: 456
+            text_align: CENTER
+    - id: page_setup
+      skip: false
+      bg_color: 0x050504
+      scrollbar_mode: "OFF"
+      scrollable: false
+      on_load:
+        then:
+          - lambda: |-
+              //ESP_LOGD("keyboard_debug",
+              //         "page_setup loaded: kb hidden=%d visible=%d x=%d y=%d w=%d h=%d",
+              //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN),
+              //         (int) lv_obj_is_visible(id(setup_kb).obj),
+              //         (int) lv_obj_get_x(id(setup_kb).obj), (int) lv_obj_get_y(id(setup_kb).obj),
+              //         (int) lv_obj_get_width(id(setup_kb).obj), (int) lv_obj_get_height(id(setup_kb).obj));
+              lv_obj_add_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
+      on_swipe_up:
+        then:
+          - lambda: |-
+                lv_indev_wait_release(lv_indev_get_act());
+                const char *tsym = lv_textarea_get_text(id(ta_tickers));
+                const char *tsh = lv_textarea_get_text(id(ta_shares));
+                id(g_tickers_raw) = "";
+                if (tsym != nullptr) id(g_tickers_raw) = std::string(tsym);
+                id(g_shares_raw) = "";
+                if (tsh != nullptr) id(g_shares_raw) = std::string(tsh);
+                const char *tcur = lv_textarea_get_text(id(ta_currency));
+                id(g_currency_code) = tcur ? std::string(tcur) : std::string("USD");
+                for (size_t ci = 0; ci < id(g_currency_code).size(); ci++) {
+                  char c = id(g_currency_code)[ci];
+                  if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
+                }
+                if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
+#          - script.execute: fetch_currency
+#          - script.execute: get_tickers_shares
+#          - script.execute: fetch_all
+          - lvgl.page.show:
+              id: page_info
+              animation: OUT_BOTTOM
+              time: 250ms
+      on_swipe_down:
+        then:
+          - lambda: |-
+                lv_indev_wait_release(lv_indev_get_act());
+                const char *tsym = lv_textarea_get_text(id(ta_tickers));
+                const char *tsh = lv_textarea_get_text(id(ta_shares));
+                id(g_tickers_raw) = "";
+                if (tsym != nullptr) id(g_tickers_raw) = std::string(tsym);
+                id(g_shares_raw) = "";
+                if (tsh != nullptr) id(g_shares_raw) = std::string(tsh);
+                const char *tcur = lv_textarea_get_text(id(ta_currency));
+                id(g_currency_code) = tcur ? std::string(tcur) : std::string("USD");
+                for (size_t ci = 0; ci < id(g_currency_code).size(); ci++) {
+                  char c = id(g_currency_code)[ci];
+                  if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
+                }
+                if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
+#          - script.execute: fetch_currency
+#          - script.execute: get_tickers_shares
+#          - script.execute: fetch_all
+          - lvgl.page.show:
+              id: page_quote
+              animation: OUT_TOP
+              time: 250ms
+      widgets:
+        - image:
+            src: img_infoback
+            x: 0
+            y: 0
+            width: 480
+            height: 480
+        - label:
+            text: "Ticker list"
+            text_font: font_setup
+            text_color: 0x8a8780
+            x: 0
+            y: 0
+        - textarea:
+            id: ta_tickers
+            x: 0
+            y: 34
+            width: 480
+            height: 48
+            one_line: true
+            text: ""
+            placeholder_text: "TSLA SPCX ..."
+            accepted_chars: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789, " #abcdefghijklmnopqrstuvwxyz.^-*=
+            max_length: 36
+            text_font: font_setup
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            radius: 10
+            pad_all: 10
+            on_focus:
+              then:
+                - lambda: |-
+                    //ESP_LOGD("keyboard_debug", "ta_tickers focus: before show hidden=%d",
+                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
+                    lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
+                - lvgl.widget.show: setup_kb
+                - lambda: |-
+                    //ESP_LOGD("keyboard_debug", "ta_tickers focus: after show hidden=%d",
+                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
+                - lvgl.keyboard.update:
+                    id: setup_kb
+                    textarea: ta_tickers
+                    mode: TEXT_UPPER
+        - label:
+            text: "Shares list"
+            text_font: font_setup
+            text_color: 0x8a8780
+            x: 0
+            y: 112
+        - textarea:
+            id: ta_shares
+            x: 114
+            y: 100
+            width: 366
+            height: 48
+            one_line: true
+            text: "626 0"
+            placeholder_text: "100 0 ..."
+            accepted_chars: "0123456789., "
+            max_length: 32
+            text_font: font_setup
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            radius: 10
+            pad_all: 10
+            on_focus:
+              then:
+                - lambda: |-
+                    //ESP_LOGD("keyboard_debug", "ta_shares focus: before show hidden=%d",
+                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
+                    lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
+                - lvgl.widget.show: setup_kb
+                - lambda: |-
+                    //ESP_LOGD("keyboard_debug", "ta_shares focus: after show hidden=%d",
+                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
+                - lvgl.keyboard.update:
+                    id: setup_kb
+                    textarea: ta_shares
+                    mode: TEXT_UPPER
+        - label:
+            text: "Currency"
+            text_font: font_ui
+            text_color: 0x8a8780
+            x: 0
+            y: 176
+        - textarea:
+            id: ta_currency
+            x: 112
+            y: 166
+            width: 80
+            height: 52
+            one_line: true
+            text: "USD"
+            placeholder_text: "USD"
+            accepted_chars: "ABCDEFGHIJKLMNOPQRSTUVWXYZ" #abcdefghijklmnopqrstuvwxyz
+            max_length: 3
+            text_font: font_setup
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            radius: 10
+            pad_all: 8
+            on_focus:
+              then:
+                - lambda: |-
+                    //ESP_LOGD("keyboard_debug", "ta_currency focus: before show hidden=%d",
+                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
+                    lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
+                - lvgl.widget.show: setup_kb
+                - lambda: |-
+                    //ESP_LOGD("keyboard_debug", "ta_currency focus: after show hidden=%d",
+                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
+                - lvgl.keyboard.update:
+                    id: setup_kb
+                    textarea: ta_currency
+                    mode: TEXT_UPPER
+        - label:
+            text: "Relay1"
+            text_font: font_ui
+            text_color: 0x8a8780
+            x: 240
+            y: 176
+        - switch:
+            id: sw_relay1
+            x: 310
+            y: 172
+            width: 80
+            height: 40
+            state:
+              checked: true   
+            on_value:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_relay1);'
+                  then:
+                    - lambda: 'id(g_relay1) = true;'
+                    - if:
+                        condition:
+                          lambda: 'return x;' # 'x' az LVGL kapcsoló aktuális állapota (true/false)
+                        then:
+                          - switch.turn_on: ha_relay1
+                        else:
+                          - switch.turn_off: ha_relay1
+                    - lambda: 'id(g_relay1) = false;'
+        - label:
+            text: "Backlight"
+            text_font: font_ui
+            text_color: 0x8a8780
+            x: 0
+            y: 218
+        - slider:
+            id: backlight_slider
+            x: 0
+            y: 250
+            width: 480
+            height: 28
+            min_value: 1
+            max_value: 100
+            value: 50
+            ext_click_area: 12
+            on_release:
+              then:
+                - light.turn_on:
+                    id: display_backlight
+                    brightness: !lambda 'return x / 100.0f;'
+#        - button:
+#            x: 16
+#            y: 300
+#            width: 90
+#            height: 44
+#            radius: 10
+##            bg_color: 0x267a58
+#            widgets:
+#              - label:
+#                  align: CENTER
+#                  text: "Save"
+#                  text_font: font_ui
+#                  text_color: 0xf2efe8
+#            on_click:
+#              then:
+#                - lambda: |-
+#                    const char *tsym = lv_textarea_get_text(id(ta_tickers));
+#                    const char *tsh = lv_textarea_get_text(id(ta_shares));
+#                    id(g_tickers_raw) = tsym ? std::string(tsym) : std::string("");
+#                    id(g_shares_raw) = tsh ? std::string(tsh) : std::string("");
+#                    id(ha_ticker_list).publish_state(id(g_tickers_raw));
+#                    id(ha_shares_list).publish_state(id(g_shares_raw));
+#                - script.execute: get_tickers_shares
+#                - script.execute: fetch_all
+#                - lvgl.page.show:
+#                    id: page_quote
+#                    animation: OUT_BOTTOM
+#                    time: 250ms
+        - button:
+            id: restart_button
+            x: 16
+            y: 300
+            width: 448
+            height: 52
+            radius: 10
+            bg_color: 0x3A3834
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Restart"
+                  text_font: font_ui
+                  text_color: 0xf2efe8
+            on_click:
+              then:
+                - script.execute: restart_device
+        - keyboard:
+            id: setup_kb
+            hidden: true
+#            on_all_events:
+#              then:
+#                - lambda: |-
+#                    ESP_LOGD("keyboard_debug",
+#                               "keyboard event=%d hidden=%d visible=%d",
+#                               (int) lv_event_get_code(event),
+#                               (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN),
+#                               (int) lv_obj_is_visible(id(setup_kb).obj));
+            align: BOTTOM_MID
+            width: 480
+            height: 180
+            textarea: ta_tickers
+            mode: TEXT_UPPER
+            on_ready:
+              then:
+                - lambda: |-
+                      ESP_LOGD("keyboard_debug", "setup_kb on_ready: hidden=%d, w=%d h=%d x=%d y=%d",
+                               (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN),
+                               (int) lv_obj_get_width(id(setup_kb).obj), (int) lv_obj_get_height(id(setup_kb).obj),
+                               (int) lv_obj_get_x(id(setup_kb).obj), (int) lv_obj_get_y(id(setup_kb).obj));
+                      lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
+                      lv_obj_set_align(id(setup_kb).obj, LV_ALIGN_BOTTOM_MID);
+                      lv_obj_set_pos(id(setup_kb).obj, 0, 0);
+                      lv_obj_move_foreground(id(setup_kb).obj);
+                      const char *tsym = lv_textarea_get_text(id(ta_tickers));
+                      const char *tsh = lv_textarea_get_text(id(ta_shares));
+                      id(g_tickers_raw) = "";
+                      if (tsym != nullptr) id(g_tickers_raw) = std::string(tsym);
+                      id(g_shares_raw) = "";
+                      if (tsh != nullptr) id(g_shares_raw) = std::string(tsh);
+                      const char *tcur = lv_textarea_get_text(id(ta_currency));
+                      id(g_currency_code) = tcur ? std::string(tcur) : std::string("USD");
+                      for (size_t ci = 0; ci < id(g_currency_code).size(); ci++) {
+                        char c = id(g_currency_code)[ci];
+                        if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
+                      }
+                      if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
+                - script.execute: get_tickers_shares
+                - script.execute: fetch_currency
+#                - script.execute: fetch_all
+                - lvgl.page.show:
+                    id: page_quote
+                    animation: OUT_BOTTOM
+                    time: 250ms
+
+
+text:
+  - platform: template
+    name: "Currency"
+    id: ha_currency
+    icon: "mdi:currency-usd"
+    optimistic: true
+    restore_value: true
+    initial_value: "USD"
+    min_length: 3
+    max_length: 3
+    mode: text
+    set_action:
+      - lambda: |-
+          id(g_currency_code) = x;
+          for (size_t ci = 0; ci < id(g_currency_code).size(); ci++) {
+            char c = id(g_currency_code)[ci];
+            if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
+          }
+          if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
+      - lvgl.textarea.update:
+          id: ta_currency
+          text: !lambda 'return id(g_currency_code);'
+      - script.execute: fetch_currency
+
+  - platform: template
+    name: "Ticker list"
+    id: ha_ticker_list
+    icon: "mdi:format-list-bulleted"
+    optimistic: true
+    restore_value: true
+    initial_value: "TSLA SPCX"
+    min_length: 0
+    max_length: 48
+    mode: text
+    set_action:
+      - lambda: |-
+          id(g_tickers_raw) = x;
+      - lvgl.textarea.update:
+          id: ta_tickers
+          text: !lambda 'return x;'
+      - script.execute: get_tickers_shares
+      - script.execute: fetch_all
+
+  - platform: template
+    name: "Share list"
+    id: ha_shares_list
+    icon: "mdi:counter"
+    optimistic: true
+    restore_value: true
+    initial_value: "626 0"
+    min_length: 0
+    max_length: 32
+    mode: text
+    set_action:
+      - lambda: |-
+          id(g_shares_raw) = x;
+      - lvgl.textarea.update:
+          id: ta_shares
+          text: !lambda 'return x;'
+      - script.execute: get_tickers_shares
+      - script.execute: fetch_all
+
+sensor:
+  - platform: internal_temperature
+    name: "CPU Temperature"
+    id: cpu_temperature
+    update_interval: 5s
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_db
+    update_interval: 10s
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Ticker 1 price"
+    id: ha_price_0
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 1 || id(g_price_0) <= 0) return NAN;
+        return id(g_price_0);
+
+  - platform: template
+    name: "Ticker 1 value"
+    id: ha_value_0
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 1 || id(g_price_0) <= 0) return NAN;
+        return id(g_price_0) * id(g_sh_0);
+
+  - platform: template
+    name: "Ticker 2 price"
+    id: ha_price_1
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 2 || id(g_price_1) <= 0) return NAN;
+        return id(g_price_1);
+
+  - platform: template
+    name: "Ticker 2 value"
+    id: ha_value_1
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 2 || id(g_price_1) <= 0) return NAN;
+        return id(g_price_1) * id(g_sh_1);
+
+  - platform: template
+    name: "Ticker 3 price"
+    id: ha_price_2
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 3 || id(g_price_2) <= 0) return NAN;
+        return id(g_price_2);
+
+  - platform: template
+    name: "Ticker 3 value"
+    id: ha_value_2
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 3 || id(g_price_2) <= 0) return NAN;
+        return id(g_price_2) * id(g_sh_2);
+
+  - platform: template
+    name: "Ticker 4 price"
+    id: ha_price_3
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 4 || id(g_price_3) <= 0) return NAN;
+        return id(g_price_3);
+
+  - platform: template
+    name: "Ticker 4 value"
+    id: ha_value_3
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 4 || id(g_price_3) <= 0) return NAN;
+        return id(g_price_3) * id(g_sh_3);
+
+  - platform: template
+    name: "Ticker 5 price"
+    id: ha_price_4
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 5 || id(g_price_4) <= 0) return NAN;
+        return id(g_price_4);
+
+  - platform: template
+    name: "Ticker 5 value"
+    id: ha_value_4
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 5 || id(g_price_4) <= 0) return NAN;
+        return id(g_price_4) * id(g_sh_4);        
+
+  - platform: template
+    name: "Ticker 6 price"
+    id: ha_price_5
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 6 || id(g_price_5) <= 0) return NAN;
+        return id(g_price_5);
+
+  - platform: template
+    name: "Ticker 6 value"
+    id: ha_value_5
+    unit_of_measurement: USD
+    accuracy_decimals: 2
+    device_class: monetary
+    state_class: measurement
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 6 || id(g_price_5) <= 0) return NAN;
+        return id(g_price_5) * id(g_sh_5);        
+
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "WiFi IP"
+      id: wifi_ip_info
+    ssid:
+      name: "WiFi SSID"
+      id: wifi_ssid_info
+    mac_address:
+      name: "WiFi MAC"
+      id: wifi_mac_info
+
+  - platform: template
+    name: "Ticker 1 symbol"
+    id: ha_sym_0
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 1) return std::string("");
+        return id(g_sym_0);
+
+  - platform: template
+    name: "Ticker 2 symbol"
+    id: ha_sym_1
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 2) return std::string("");
+        return id(g_sym_1);
+
+  - platform: template
+    name: "Ticker 3 symbol"
+    id: ha_sym_2
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 3) return std::string("");
+        return id(g_sym_2);
+
+  - platform: template
+    name: "Ticker 4 symbol"
+    id: ha_sym_3
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 4) return std::string("");
+        return id(g_sym_3);
+
+  - platform: template
+    name: "Ticker 5 symbol"
+    id: ha_sym_4
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 5) return std::string("");
+        return id(g_sym_4);
+
+  - platform: template
+    name: "Ticker 6 symbol"
+    id: ha_sym_5
+    update_interval: ${poll_seconds}
+    lambda: |-
+        if (id(g_count) < 6) return std::string("");
+        return id(g_sym_5);
+
+button:
+  - platform: template
+    name: Refresh quotes
+    id: ha_refresh
+    on_press:
+      - script.execute: fetch_all
+
+switch:
+  - platform: gpio
+    pin: 40
+    id: ha_relay1
+    name: 'Relay 1'        
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return !id(g_relay1);'
+          then:
+            - lambda: 'id(g_relay1) = true;'
+            - lvgl.widget.update:
+                id: sw_relay1
+                state:
+                  checked: true
+            - lambda: 'id(g_relay1) = false;'
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return !id(g_relay1);'
+          then:
+            - lambda: 'id(g_relay1) = true;'
+            - lvgl.widget.update:
+                id: sw_relay1
+                state:
+                  checked: false
+            - lambda: 'id(g_relay1) = false;'
