@@ -10,7 +10,7 @@
 substitutions:
   device_name: stoxbox
   poll_seconds: "60s"
-  app_version: "0.3"
+  app_version: "0.31"
   ha_topic: "stoxbox/quote"
   
 esphome:
@@ -32,28 +32,8 @@ esphome:
     - priority: 800.0  # This is where all hardware initialization of vital components is executed. For example setting switches to their initial state.
       then:
         - lambda: |-
-            int deg = id(g_rotation);
-            
-            display::DisplayRotation rot = display::DISPLAY_ROTATION_0_DEGREES;
-            lv_display_rotation_t lvrot = LV_DISPLAY_ROTATION_0;
-  
-            if (deg == 90) {
-              rot = display::DISPLAY_ROTATION_90_DEGREES;
-              lvrot = LV_DISPLAY_ROTATION_90;
-            } else if (deg == 180) {
-              rot = display::DISPLAY_ROTATION_180_DEGREES;
-              lvrot = LV_DISPLAY_ROTATION_180;
-            } else if (deg == 270) {
-              rot = display::DISPLAY_ROTATION_270_DEGREES;
-              lvrot = LV_DISPLAY_ROTATION_270;
-            }
-  
-            id(tft_display).set_rotation(rot);
-  
-            lv_display_t *disp = lv_display_get_default();
-            if (disp != nullptr) {
-              lv_display_set_rotation(disp, lvrot);
-            }
+            // LVGL is responsible for display + touchscreen rotation.
+            // The persisted value is applied after LVGL has initialized.
             lv_label_set_text(id(lbl_appname), "StoxBox v${app_version}");
             lv_obj_clear_flag(id(lbl_appname), LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(id(lbl_author), LV_OBJ_FLAG_HIDDEN);            
@@ -69,6 +49,8 @@ esphome:
         - lvgl.textarea.update:
             id: ta_currency
             text: !lambda 'return id(g_currency_code);'
+        - lvgl.display.set_rotation:
+            rotation: !lambda 'return id(g_rotation);'
         - lvgl.switch.update: 
             id: sw_relay1
             state:
@@ -83,7 +65,12 @@ esphome:
               checked: !lambda 'return id(g_relay3);'
         - lvgl.dropdown.update: 
             id: dd_rotation
-            selected_index: !lambda 'return id(g_rotation);'
+            selected_index: !lambda |-
+              int deg = id(g_rotation);
+              if (deg == 90) return 1;
+              if (deg == 180) return 2;
+              if (deg == 270) return 3;
+              return 0;
         - lambda: |-
             id(ha_ticker_list).publish_state(id(g_tickers_raw));
             id(ha_shares_list).publish_state(id(g_shares_raw));
@@ -125,20 +112,6 @@ esphome:
             snprintf(b, sizeof(b), "MAC: %s", mac.empty() ? "--" : mac.c_str());
             lv_label_set_text(id(info_mac), b);          
 
-            int deg = id(g_rotation);
-            lv_display_rotation_t lvrot = LV_DISPLAY_ROTATION_0;
-            if (deg == 90) {
-              lvrot = LV_DISPLAY_ROTATION_90;
-            } else if (deg == 180) {
-              lvrot = LV_DISPLAY_ROTATION_180;
-            } else if (deg == 270) {
-              lvrot = LV_DISPLAY_ROTATION_270;
-            }
-  
-            lv_display_t *disp = lv_display_get_default();
-            if (disp != nullptr) {
-              lv_display_set_rotation(disp, lvrot);
-            } 
         - light.turn_on:
             id: display_backlight
             brightness: 0.5
@@ -301,7 +274,7 @@ touchscreen:
 
 image:
   - platform: file
-    file: "logo2.png"
+    file: "logo.png"
     id: img_applogo
     type: RGB565
     resize: 480x480
@@ -694,26 +667,12 @@ script:
     then:
       - lambda: |-
           int deg = id(g_rotation);
-          if (deg != 0 && deg != 90 && deg != 180 && deg != 270) deg = 0;
-          id(g_rotation) = deg;
-          display::DisplayRotation rot = display::DISPLAY_ROTATION_0_DEGREES;
-          lv_disp_rotation_t lvrot = LV_DISPLAY_ROTATION_0;
-          if (deg == 90) {
-            rot = display::DISPLAY_ROTATION_90_DEGREES;
-            lvrot = LV_DISPLAY_ROTATION_90;
-          } else if (deg == 180) {
-            rot = display::DISPLAY_ROTATION_180_DEGREES;
-            lvrot = LV_DISPLAY_ROTATION_180;
-          } else if (deg == 270) {
-            rot = display::DISPLAY_ROTATION_270_DEGREES;
-            lvrot = LV_DISPLAY_ROTATION_270;
+          if (deg != 0 && deg != 90 && deg != 180 && deg != 270) {
+            deg = 0;
+            id(g_rotation) = 0;
           }
-          id(tft_display).set_rotation(rot);
-          lv_display_t *disp = lv_display_get_default();
-          if (disp != nullptr) {
-            lv_display_set_rotation(disp, lvrot);
-          }
-      - lvgl.widget.redraw:
+      - lvgl.display.set_rotation:
+          rotation: !lambda 'return id(g_rotation);'
       - lvgl.dropdown.update:
           id: dd_rotation
           selected_index: !lambda |-
@@ -732,7 +691,6 @@ script:
           const char *opts[4] = {"0°", "90°", "180°", "270°"};
           id(ha_rotation).publish_state(opts[idx]);
           id(g_rotation_busy) = false;
-
 
   - id: get_tickers_shares
     then:
@@ -1694,8 +1652,8 @@ interval:
   - interval: 1s
     then:
       - lambda: |-
-          if (!id(page_info).is_visible()) {            
-            return;          
+          if (lv_scr_act() != id(page_info).obj {
+            return; 
           }
           // ------------------------------------------------------------
           // SYSTEM INFO 1s
@@ -1827,6 +1785,8 @@ interval:
                 slot: id(g_index)
 
 lvgl:
+  # Enable LVGL runtime rotation; it also rotates touchscreen coordinates.
+  rotation: 0
   displays:
     - tft_display
   touchscreens:
@@ -2633,25 +2593,11 @@ lvgl:
                     then:
                       - lambda: |-
                           int idx = (int) x;
-                          int deg = 0;
-                          if (idx == 1) deg = 90;
-                          else if (idx == 2) deg = 180;
-                          else if (idx == 3) deg = 270;
-                          id(g_rotation) = deg;
-                          lv_display_rotation_t lvrot = LV_DISPLAY_ROTATION_0;
-                          if (deg == 90) {
-                            lvrot = LV_DISPLAY_ROTATION_90;
-                          } else if (deg == 180) {
-                            lvrot = LV_DISPLAY_ROTATION_180;
-                          } else if (deg == 270) {
-                            lvrot = LV_DISPLAY_ROTATION_270;
-                          }
-                
-                          lv_display_t *disp = lv_display_get_default();
-                          if (disp != nullptr) {
-                            lv_display_set_rotation(disp, lvrot);
-                          } 
-                      - lvgl.page.show: 
+                          if (idx == 1) id(g_rotation) = 90;
+                          else if (idx == 2) id(g_rotation) = 180;
+                          else if (idx == 3) id(g_rotation) = 270;
+                          else id(g_rotation) = 0;
+                      - lvgl.page.show:
                           id: page_setup
                       - script.execute: apply_rotation
         - label:
@@ -2843,7 +2789,7 @@ select:
     icon: "mdi:screen-rotation"
     entity_category: config
     optimistic: true
-    restore_value: true
+    # g_rotation is the single persisted source of truth.
     initial_option: "0°"
     options:
       - "0°"
@@ -2861,7 +2807,7 @@ select:
                 else if (x == "180°") deg = 180;
                 else if (x == "270°") deg = 270;
                 id(g_rotation) = deg;
-#            - script.execute: apply_rotation
+            - script.execute: apply_rotation
 
 text:
   - platform: template
