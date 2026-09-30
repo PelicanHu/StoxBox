@@ -10,7 +10,7 @@
 substitutions:
   device_name: stoxbox
   poll_seconds: "60s"
-  app_version: "0.2"
+  app_version: "0.3"
   ha_topic: "stoxbox/quote"
   
 esphome:
@@ -29,75 +29,142 @@ esphome:
   friendly_name: 'StoxBox'
   min_version: "2025.2.0"
   on_boot:
-    priority: -100
-    then:
-      - delay: 1s
-      - lvgl.textarea.update:
-          id: ta_tickers
-          text: !lambda 'return id(g_tickers_raw);'
-      - lvgl.textarea.update:
-          id: ta_shares
-          text: !lambda 'return id(g_shares_raw);'
-      - lvgl.textarea.update:
-          id: ta_currency
-          text: !lambda 'return id(g_currency_code);'
-      - lvgl.switch.update: 
-          id: sw_relay1
-          state:
-            checked: !lambda 'return id(g_relay1);'
-      - lambda: |-
-          id(ha_ticker_list).publish_state(id(g_tickers_raw));
-          id(ha_shares_list).publish_state(id(g_shares_raw));
-          id(ha_currency).publish_state(id(g_currency_code));
-          id(ha_relay1).publish_state(id(g_relay1));
-          // Version / build time
-          lv_obj_clear_flag(id(app_version), LV_OBJ_FLAG_HIDDEN);
-          lv_label_set_text(id(app_version), "StoxBox v${app_version}");
-          lv_label_set_text(id(info_version), "${app_version}");
-          lv_label_set_text(id(info_build), __DATE__ " " __TIME__);
-      - light.turn_on:
-          id: display_backlight
-          brightness: 0.5
-          transition_length: 0s
-      - lvgl.page.show:
-          id: page_splash
-          animation: fade_in
-          time: 500ms          
-      - wait_until:
-          condition:
-            wifi.connected:
-          timeout: 30s
-      - lambda: |-
-          char b[160];
-          
-          // CPU / chip revision
-          esp_chip_info_t chip_info;
-          esp_chip_info(&chip_info);
-          snprintf(b, sizeof(b), "ESP32-S3 rev %d.%d",
-                   chip_info.revision / 100, chip_info.revision % 100);
-          lv_label_set_text(id(info_cpu), b);
+    - priority: 800.0  # This is where all hardware initialization of vital components is executed. For example setting switches to their initial state.
+      then:
+        - lambda: |-
+            int deg = id(g_rotation);
+            
+            display::DisplayRotation rot = display::DISPLAY_ROTATION_0_DEGREES;
+            lv_display_rotation_t lvrot = LV_DISPLAY_ROTATION_0;
+  
+            if (deg == 90) {
+              rot = display::DISPLAY_ROTATION_90_DEGREES;
+              lvrot = LV_DISPLAY_ROTATION_90;
+            } else if (deg == 180) {
+              rot = display::DISPLAY_ROTATION_180_DEGREES;
+              lvrot = LV_DISPLAY_ROTATION_180;
+            } else if (deg == 270) {
+              rot = display::DISPLAY_ROTATION_270_DEGREES;
+              lvrot = LV_DISPLAY_ROTATION_270;
+            }
+  
+            id(tft_display).set_rotation(rot);
+  
+            lv_display_t *disp = lv_display_get_default();
+            if (disp != nullptr) {
+              lv_display_set_rotation(disp, lvrot);
+            }
+            lv_label_set_text(id(lbl_appname), "StoxBox v${app_version}");
+            lv_obj_clear_flag(id(lbl_appname), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(lbl_author), LV_OBJ_FLAG_HIDDEN);            
+    - priority: -100
+      then:
+        - delay: 1s
+        - lvgl.textarea.update:
+            id: ta_tickers
+            text: !lambda 'return id(g_tickers_raw);'
+        - lvgl.textarea.update:
+            id: ta_shares
+            text: !lambda 'return id(g_shares_raw);'
+        - lvgl.textarea.update:
+            id: ta_currency
+            text: !lambda 'return id(g_currency_code);'
+        - lvgl.switch.update: 
+            id: sw_relay1
+            state:
+              checked: !lambda 'return id(g_relay1);'
+        - lvgl.switch.update: 
+            id: sw_relay2
+            state:
+              checked: !lambda 'return id(g_relay2);'
+        - lvgl.switch.update: 
+            id: sw_relay3
+            state:
+              checked: !lambda 'return id(g_relay3);'
+        - lvgl.dropdown.update: 
+            id: dd_rotation
+            selected_index: !lambda 'return id(g_rotation);'
+        - lambda: |-
+            id(ha_ticker_list).publish_state(id(g_tickers_raw));
+            id(ha_shares_list).publish_state(id(g_shares_raw));
+            id(ha_currency).publish_state(id(g_currency_code));
+            id(ha_relay1).publish_state(id(g_relay1));
+            id(ha_relay2).publish_state(id(g_relay2));
+            id(ha_relay3).publish_state(id(g_relay3));
+            id(ha_rotation).publish_state(id(g_rotation));
+            
+            id(g_loaded_0) = false;
+            id(g_loaded_1) = false;
+            id(g_loaded_2) = false;
+            id(g_loaded_3) = false;
+            id(g_loaded_4) = false;
+            id(g_loaded_5) = false;
+            
+            lv_label_set_text(id(info_version), "${app_version}");
+            lv_label_set_text(id(info_build), __DATE__ " " __TIME__);
+            char b[160];
+           
+            // CPU / chip revision
+            esp_chip_info_t chip_info;
+            esp_chip_info(&chip_info);
+            snprintf(b, sizeof(b), "ESP32-S3 rev %d.%d",
+                     chip_info.revision / 100, chip_info.revision % 100);
+            lv_label_set_text(id(info_cpu), b);
+  
+            // Flash size
+            uint32_t flash_size = 0;
+            if (esp_flash_get_size(nullptr, &flash_size) == ESP_OK) {
+              snprintf(b, sizeof(b), "%lu MB", (unsigned long)(flash_size / (1024UL * 1024UL)));
+            } else {
+              snprintf(b, sizeof(b), "--");
+            }
+            lv_label_set_text(id(info_flash), b);
+  
+            // MAC
+            std::string mac = id(wifi_mac_info).state;
+            snprintf(b, sizeof(b), "MAC: %s", mac.empty() ? "--" : mac.c_str());
+            lv_label_set_text(id(info_mac), b);          
 
-          // Flash size
-          uint32_t flash_size = 0;
-          if (esp_flash_get_size(nullptr, &flash_size) == ESP_OK) {
-            snprintf(b, sizeof(b), "%lu MB", (unsigned long)(flash_size / (1024UL * 1024UL)));
-          } else {
-            snprintf(b, sizeof(b), "--");
-          }
-          lv_label_set_text(id(info_flash), b);
-          
-          // SSID
-          std::string ssid = id(wifi_ssid_info).state;
-          lv_label_set_text(id(info_ssid), ssid.empty() ? "" : ssid.c_str());
-      - delay: 2s
-      - script.execute: fetch_currency
-      - script.wait: fetch_currency  
-      - script.execute: get_tickers_shares
-#      - script.execute: paint_active
-      - lvgl.page.show:
-          id: page_quote
-          animation: fade_in
-          time: 500ms   
+            int deg = id(g_rotation);
+            lv_display_rotation_t lvrot = LV_DISPLAY_ROTATION_0;
+            if (deg == 90) {
+              lvrot = LV_DISPLAY_ROTATION_90;
+            } else if (deg == 180) {
+              lvrot = LV_DISPLAY_ROTATION_180;
+            } else if (deg == 270) {
+              lvrot = LV_DISPLAY_ROTATION_270;
+            }
+  
+            lv_display_t *disp = lv_display_get_default();
+            if (disp != nullptr) {
+              lv_display_set_rotation(disp, lvrot);
+            } 
+        - light.turn_on:
+            id: display_backlight
+            brightness: 0.5
+            transition_length: 0s
+        - lvgl.page.show:
+            id: page_splash
+            animation: fade_in
+            time: 250ms          
+        - wait_until:
+            condition:
+              wifi.connected:
+            timeout: 30s
+        - lambda: |-
+            // SSID
+            std::string ssid = id(wifi_ssid_info).state;
+            lv_label_set_text(id(info_ssid), ssid.empty() ? "" : ssid.c_str());
+        - delay: 2s
+        - script.execute: fetch_currency
+        - script.wait: fetch_currency  
+        - script.execute: get_tickers_shares
+        - script.execute:
+            id: fetch_one
+            slot: 0
+        - lvgl.page.show:
+            id: page_quote
+        - script.execute: fetch_all
 esp32:
   variant: esp32s3
   flash_size: 16MB
@@ -120,6 +187,8 @@ api:
 ota:
   - platform: esphome
     on_begin:
+#      - lvgl.page.show: 
+#          id: page_splash
       - light.turn_off:
           id: display_backlight
           transition_length: 0s
@@ -128,7 +197,7 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  use_address: 192.168.0.15
+  use_address: 192.168.0.20
   ap:
     ssid: StoxBox-Setup
     password: stockbox1234
@@ -142,7 +211,7 @@ time:
     on_time_sync:
       then:
         - script.execute: paint_session
-        - script.execute: fetch_all
+#        - script.execute: fetch_all
 
 # mqtt: optional
 
@@ -231,11 +300,13 @@ touchscreen:
     i2c_id: touchscreen_bus
 
 image:
-  - file: "logo.png"
+  - platform: file
+    file: "logo2.png"
     id: img_applogo
     type: RGB565
     resize: 480x480
-  - file: "back.png"
+  - platform: file
+    file: "back.png"
     id: img_infoback
     type: RGB565
     resize: 480x480
@@ -248,7 +319,7 @@ font:
   - file: "gfonts://Google Sans"
     id: font_chg
     size: 32
-    glyphs: "0123456789.,-+% "
+    glyphs: "0123456789.,-+% bypelhu"
   - file: "gfonts://Google Sans"
     id: font_value
     size: 52
@@ -264,7 +335,7 @@ font:
   - file: "gfonts://Google Sans"
     id: font_setup
     size: 24
-    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~°"
   - file: "gfonts://Roboto Mono"
     id: font_info
     size: 25
@@ -278,7 +349,7 @@ globals:
   - id: g_shares_raw
     type: std::string
     restore_value: yes
-    initial_value: '"626 0"'
+    initial_value: '"100 0"'
   - id: g_count
     type: int
     restore_value: no
@@ -328,6 +399,24 @@ globals:
     restore_value: no
     initial_value: "false"
   - id: g_relay1
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_relay2
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_relay3
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # Display rotation in degrees: 0, 90, 180 or 270. Restored across reboots.
+  - id: g_rotation
+    type: int
+    restore_value: yes
+    initial_value: "0"
+  # Guard against HA <-> LVGL feedback loops while applying rotation.
+  - id: g_rotation_busy
     type: bool
     restore_value: no
     initial_value: "false"
@@ -599,8 +688,57 @@ script:
       - lambda: |-
           esp_restart();
 
+  # Apply persisted rotation to the display + LVGL (and keep the setup dropdown in sync).
+  - id: apply_rotation
+    mode: restart
+    then:
+      - lambda: |-
+          int deg = id(g_rotation);
+          if (deg != 0 && deg != 90 && deg != 180 && deg != 270) deg = 0;
+          id(g_rotation) = deg;
+          display::DisplayRotation rot = display::DISPLAY_ROTATION_0_DEGREES;
+          lv_disp_rotation_t lvrot = LV_DISPLAY_ROTATION_0;
+          if (deg == 90) {
+            rot = display::DISPLAY_ROTATION_90_DEGREES;
+            lvrot = LV_DISPLAY_ROTATION_90;
+          } else if (deg == 180) {
+            rot = display::DISPLAY_ROTATION_180_DEGREES;
+            lvrot = LV_DISPLAY_ROTATION_180;
+          } else if (deg == 270) {
+            rot = display::DISPLAY_ROTATION_270_DEGREES;
+            lvrot = LV_DISPLAY_ROTATION_270;
+          }
+          id(tft_display).set_rotation(rot);
+          lv_display_t *disp = lv_display_get_default();
+          if (disp != nullptr) {
+            lv_display_set_rotation(disp, lvrot);
+          }
+      - lvgl.widget.redraw:
+      - lvgl.dropdown.update:
+          id: dd_rotation
+          selected_index: !lambda |-
+            int deg = id(g_rotation);
+            if (deg == 90) return 1;
+            if (deg == 180) return 2;
+            if (deg == 270) return 3;
+            return 0;
+      - lambda: |-
+          int deg = id(g_rotation);
+          int idx = 0;
+          if (deg == 90) idx = 1;
+          else if (deg == 180) idx = 2;
+          else if (deg == 270) idx = 3;
+          id(g_rotation_busy) = true;
+          const char *opts[4] = {"0°", "90°", "180°", "270°"};
+          id(ha_rotation).publish_state(opts[idx]);
+          id(g_rotation_busy) = false;
+
 
   - id: get_tickers_shares
+    then:
+      - script.execute: get_tickers
+      - script.execute: get_shares
+  - id: get_tickers
     then:
       - lambda: |-
             std::string raw = id(g_tickers_raw);
@@ -645,9 +783,13 @@ script:
             if (ns > 5) id(g_sym_5) = syms[5];
             id(g_count) = ns;
             if (ns == 0 || id(g_index) < 0 || id(g_index) >= ns) id(g_index) = 0;
+  - id: get_shares
+    then:
+      - lambda: |-
             std::string sr = id(g_shares_raw);
             float shs[8];
             int nh = 0;
+            int ns = id(g_count);
             size_t q = 0;
             while (q < sr.size() && nh < 6) {
               while (q < sr.size() && (sr[q] == ' ' || sr[q] == ',' || sr[q] == ';' || sr[q] == '\n' || sr[q] == '\t')) q++;
@@ -681,7 +823,6 @@ script:
             id(g_sh_3) = out3;
             id(g_sh_4) = out4;
             id(g_sh_5) = out5;
-      - script.execute: paint_active
   - id: paint_active
     then:
       - lambda: |-
@@ -828,9 +969,11 @@ script:
             if (open) {
               lv_label_set_text(id(lbl_status), "OPEN");
               lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x3DCF8E), LV_PART_MAIN);
-              lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x3DCF8E), LV_PART_MAIN);
+              //lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x3DCF8E), LV_PART_MAIN);
+              lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x10261C), LV_PART_MAIN);
               lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x10261C), LV_PART_MAIN);
-              
+              lv_obj_set_x(id(status_box), 390); 
+              lv_obj_set_width(id(status_box), 90);
             } else {
               bool pre=id(g_premarket);
               bool after=id(g_aftermarket);
@@ -840,16 +983,24 @@ script:
                 //lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x2D6F9A), LV_PART_MAIN);
                 lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x0D1C26), LV_PART_MAIN);
                 lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x0D1C26), LV_PART_MAIN);
+                lv_obj_set_x(id(status_box), 320); 
+                lv_obj_set_width(id(status_box), 160);
               } else if (after) {
                 lv_label_set_text(id(lbl_status), "AFTER HOURS");
                 lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xC58CFF), LV_PART_MAIN);
-                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x6E4A91), LV_PART_MAIN);
+                //lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x6E4A91), LV_PART_MAIN);
+                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x1B1224), LV_PART_MAIN);
                 lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x1B1224), LV_PART_MAIN);
+                lv_obj_set_x(id(status_box), 320); 
+                lv_obj_set_width(id(status_box), 160);
               } else {
                 lv_label_set_text(id(lbl_status), "CLOSED");
                 lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x8A8780), LV_PART_MAIN);
-                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x3A3A34), LV_PART_MAIN);
+                //lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x3A3A34), LV_PART_MAIN);
+                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x141412), LV_PART_MAIN);
                 lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x141412), LV_PART_MAIN);
+                lv_obj_set_x(id(status_box), 380); 
+                lv_obj_set_width(id(status_box), 100);
               }
             }
             lv_obj_t *tickers[6] = { id(dot_0), id(dot_1), id(dot_2), id(dot_3), id(dot_4), id(dot_5) };
@@ -871,16 +1022,15 @@ script:
                 lv_obj_set_height(tickers[d], 28);
                 lv_obj_set_style_text_align(tickers[d], LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
                 lv_color_t bright,dim;
-                //ESP_LOGD("paint_active","**************  %d. loaded: %s show: %s **************",d,loads[d] ? "Yes": "No",id(g_show_value) ? "Yes" : "No");
                 if(loads[d]) {
                   bool up = chgs[d] >= 0.0f;
                   bright = up ? lv_color_hex(0x3DCF8E) : lv_color_hex(0xEF5D5D);
                   dim = up ? lv_color_hex(0x267A58) : lv_color_hex(0x8F3838);
-                  //if(i == d) lv_obj_clear_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);                  
+                  if(i == d) lv_obj_add_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN); 
                 } else {
-                  bright = lv_color_hex(777777);
+                  bright = lv_color_hex(0x777777);
                   dim = lv_color_hex(0x444444);
-                  //if(i == d) lv_obj_add_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);                  
+                  if(i == d) lv_obj_clear_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);                  
                 }  
                 lv_obj_set_style_text_color(tickers[d], d == i ? bright : dim, LV_PART_MAIN);
               }
@@ -918,8 +1068,6 @@ script:
               vn++;
             }
 
-            //ESP_LOGD("paint_active","values: %d",vn);
-            
             #if LVGL_VERSION_MAJOR >= 9
             static lv_point_precise_t pts[MAX_POINTS];
             static lv_point_precise_t prev_pts[2];
@@ -958,7 +1106,7 @@ script:
                 span = 1.0f;
 
               // --------------------------------------------------
-              // time scale
+              // time scale to show
               // PRE:     04:00 -> 09:30
               // OPEN:    09:30 -> 16:00
               // AFTER:   09:30 -> 20:00
@@ -984,7 +1132,6 @@ script:
               int total_seconds = end_seconds - start_seconds;
               if (total_seconds <= 0) total_seconds = 60;
 
-              //ESP_LOGD("paint_active","start min: %d end min: %d",start_minutes,end_minutes);
               // --------------------------------------------------
               // Graph points
               // --------------------------------------------------
@@ -1009,7 +1156,6 @@ script:
                 if (y < 0) y = 0;
                 if (y > height + 4) y = height + 4;
 
-                //ESP_LOGD("paint_active","time: %.0f, value: %.2f  --->  x: %d, y: %d",((float)day_seconds[k]/60.0f),vals[k],x,y);
                 pts[k].x = (lv_coord_t)x;
                 pts[k].y = (lv_coord_t)y;
               }
@@ -1265,7 +1411,6 @@ script:
                                     id(g_price_5) = 0; id(g_chg_5) = 0; id(g_pct_5) = 0; id(g_hi_5) = 0; id(g_lo_5) = 0; id(g_ts_5) = 0; id(g_loaded_5) = false; 
                                     sym = id(g_sym_5); id(g_name_5) = sym;
                                   }    
-                                  ESP_LOGD("fetch_one","************** ticker: %s, FAILED **************",sym.c_str());
                                   return false;
                                 }
                                 bool preaft=id(g_premarket) || id(g_aftermarket);
@@ -1406,7 +1551,6 @@ script:
                                     }
 
                                     if (!keep) continue;
-                                    //ESP_LOGD("fetch_one","minutes: %d",minutes);
                                     char item[40];
                                     snprintf(item, sizeof(item), "%d|%.4f", seconds, close_value);
 
@@ -1423,12 +1567,6 @@ script:
                                   if (i == 4) id(g_spark_4) = spark;
                                   if (i == 5) id(g_spark_5) = spark;
                                 }                                
-                                //ESP_LOGD("fetch_one","ticker: %s  ts, close values length: %d",sym.c_str(),spark.length());
-                                //size_t chunk_size = 100;
-                                //for (size_t i = 0; i < spark.length(); i += chunk_size) {
-                                //    std::string chunk = spark.substr(i, chunk_size);
-                                //    ESP_LOGD("fetch_one", "  Részlet [%d-%d]: %s", i, i + chunk.length(), chunk.c_str());
-                                //}
                                 return true;
                               });
                               int i = id(g_fetch_i);
@@ -1486,11 +1624,9 @@ script:
                       rp += 7;
                       char *end = nullptr;
                       float rate = strtof(body.c_str() + rp, &end);
-                      ESP_LOGD("fetch_currency","************** currency: %s, rate: %.2f **************",cc.c_str(),rate);                          
                       if (end != body.c_str() + rp && rate > 0.0f) {
                         id(g_fx_rate) = rate;
                         id(g_fx_loaded) = true;
-                        //ESP_LOGD("fetch_currency","************** currency: %s, loaded **************",cc.c_str());                          
                       } else {
                         ESP_LOGD("fetch_currency","************** currency: %s, NOT LOADED **************",cc.c_str());
                       }
@@ -1554,12 +1690,13 @@ script:
           slot: 5
       - script.wait: fetch_one
 
-
 interval:
   - interval: 1s
     then:
       - lambda: |-
-          //if (!id(page_info).is_visible()) {            return;          }
+          if (!id(page_info).is_visible()) {            
+            return;          
+          }
           // ------------------------------------------------------------
           // SYSTEM INFO 1s
           // ------------------------------------------------------------
@@ -1604,13 +1741,14 @@ interval:
             snprintf(b, sizeof(b), "--:--:--");
           }
           lv_label_set_text(id(info_time), b);
+
+          // IP
+          std::string ip = id(wifi_ip_info).state;
+          snprintf(b, sizeof(b), "%s", ip.empty() ? "--" : ip.c_str());
+          lv_label_set_text(id(info_ip), b);      
   - interval: 30s
     then:
       - lambda: |-
-          //if (!id(page_info).is_visible()) {return;}
-          // ------------------------------------------------------------
-          // SYSTEM INFO 30s
-          // ------------------------------------------------------------
           char b[160];
           auto t = id(sntp_time).now();
           
@@ -1619,13 +1757,10 @@ interval:
           if (isnan(cpu_temp)) snprintf(b, sizeof(b), "--");
           else snprintf(b, sizeof(b), "%.1f °C", cpu_temp);
           lv_label_set_text(id(info_cpu_temp), b);
+    
   - interval: 3600s
     then:
       - lambda: |-
-          //if (!id(page_info).is_visible()) {            return;          }
-          // ------------------------------------------------------------
-          // SYSTEM INFO 1h
-          // ------------------------------------------------------------
           char b[160];
 
           // Running application partition / sketch space.
@@ -1710,7 +1845,7 @@ lvgl:
             width: 480
             height: 480
         - label:
-            id: app_version
+            id: lbl_appname
             text: "StoxBox "
             text_font: font_value
             text_color: 0xe0e0e0  
@@ -1718,26 +1853,33 @@ lvgl:
             y: 20
             width: 240
             hidden: true
+        - label:
+            id: lbl_author
+            text: "by pel.hu"
+            text_font: font_chg
+            text_color: 0xe0e0e0  
+            x: 336
+            y: 435
+            hidden: true
     - id: page_info
       bg_color: 0x050504
       on_swipe_up:
         then:
           - lambda: |-
-              //ESP_LOGD("page_info", "swipe up -> page_quote");
               lv_indev_wait_release(lv_indev_get_act());
           - lvgl.page.show:
               id: page_quote
-              animation: OUT_TOP
-              time: 250ms
       on_swipe_down:
         then:
           - lambda: |-
-              //ESP_LOGD("page_info", "swipe down -> page_setup");
               lv_indev_wait_release(lv_indev_get_act());
+          - light.turn_off: display_backlight
           - lvgl.page.show:
               id: page_setup
               animation: OUT_BOTTOM
               time: 250ms
+          - delay: 250ms  
+          - light.turn_on: display_backlight
       widgets:
         - image:
             src: img_infoback
@@ -1769,7 +1911,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 40
+            y: 34
             width: 100
             height: 32
         - label:
@@ -1778,7 +1920,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 110
-            y: 40
+            y: 34
             width: 360
             height: 32
             long_mode: CLIP
@@ -1788,7 +1930,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 76
+            y: 64
             width: 185
             height: 32
             long_mode: CLIP
@@ -1798,7 +1940,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 76
+            y: 64
             width: 275
             height: 32
             long_mode: CLIP
@@ -1808,7 +1950,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 112
+            y: 94
             width: 185
             height: 32
             long_mode: CLIP
@@ -1818,7 +1960,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 112
+            y: 94
             width: 275
             height: 32
             long_mode: CLIP
@@ -1828,7 +1970,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 148
+            y: 124
             width: 185
             height: 32
             long_mode: CLIP
@@ -1838,7 +1980,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 148
+            y: 124
             width: 275
             height: 32
             long_mode: CLIP
@@ -1848,7 +1990,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 184
+            y: 154
             width: 185
             height: 32
             long_mode: CLIP
@@ -1858,7 +2000,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 184
+            y: 154
             width: 275
             height: 32
             long_mode: CLIP
@@ -1868,7 +2010,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 220
+            y: 184
             width: 185
             height: 32
             long_mode: CLIP
@@ -1878,7 +2020,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 220
+            y: 184
             width: 275
             height: 32
             long_mode: CLIP
@@ -1888,7 +2030,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 256
+            y: 214
             width: 185
             height: 32
             long_mode: CLIP
@@ -1898,7 +2040,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 256
+            y: 214
             width: 275
             height: 32
             long_mode: CLIP
@@ -1908,7 +2050,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 292
+            y: 244
             width: 140
             height: 32
             long_mode: CLIP
@@ -1918,7 +2060,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 150
-            y: 292
+            y: 244
             width: 320
             height: 32
             long_mode: CLIP
@@ -1928,7 +2070,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 328
+            y: 274
             width: 185
             height: 32
             long_mode: CLIP
@@ -1938,7 +2080,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 328
+            y: 274
             width: 275
             height: 32
             long_mode: CLIP
@@ -1948,12 +2090,52 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 364
+            y: 304
             width: 185
             height: 32
             long_mode: CLIP
         - label:
             id: info_channel
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 304
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "IP address"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 334
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_ip
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 195
+            y: 334
+            width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "MAC address"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 364
+            width: 185
+            height: 32
+            long_mode: CLIP
+        - label:
+            id: info_mac
             text: "--"
             text_font: font_info
             text_color: 0xf2efe8
@@ -1968,7 +2150,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 400
+            y: 394
             width: 140
             height: 32
             long_mode: CLIP
@@ -1978,7 +2160,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 150
-            y: 400
+            y: 394
             width: 320
             height: 32
             long_mode: CLIP
@@ -1988,7 +2170,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 436
+            y: 424
             width: 145
             height: 32
             long_mode: CLIP
@@ -1998,7 +2180,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 155
-            y: 436
+            y: 424
             width: 315
             height: 32
             long_mode: CLIP
@@ -2032,24 +2214,18 @@ lvgl:
       on_swipe_up:
         then:
           - lambda: |-
-              //ESP_LOGD("keyboard_debug", "quote swipe_up: showing page_setup");
               lv_indev_wait_release(lv_indev_get_act());
           - lvgl.page.show:
               id: page_setup
-              animation: OUT_TOP
-              time: 250ms
       on_swipe_down:
         then:
           - lambda: "lv_indev_wait_release(lv_indev_get_act());"
           - lvgl.page.show:
               id: page_info
-              animation: OUT_BOTTOM
-              time: 250ms
       on_double_click:
         then:
           - lambda: |-
               id(g_show_value) = !id(g_show_value);
-              ESP_LOGD("double_click","show: %s",id(g_show_value) ? "Yes" : "No");
           - script.execute: paint_active    
       widgets:
         - label:
@@ -2070,7 +2246,7 @@ lvgl:
             long_mode: DOT
             width: 320
             x: 0
-            y: 4
+            y: 8
         - obj:
             id: status_box
             x: 320 
@@ -2238,55 +2414,23 @@ lvgl:
       on_load:
         then:
           - lambda: |-
-              //ESP_LOGD("keyboard_debug",
-              //         "page_setup loaded: kb hidden=%d visible=%d x=%d y=%d w=%d h=%d",
-              //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN),
-              //         (int) lv_obj_is_visible(id(setup_kb).obj),
-              //         (int) lv_obj_get_x(id(setup_kb).obj), (int) lv_obj_get_y(id(setup_kb).obj),
-              //         (int) lv_obj_get_width(id(setup_kb).obj), (int) lv_obj_get_height(id(setup_kb).obj));
               lv_obj_add_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
+          - lvgl.widget.focus: backlight_slider    
       on_swipe_up:
         then:
           - lambda: |-
                 lv_indev_wait_release(lv_indev_get_act());
-                const char *tsym = lv_textarea_get_text(id(ta_tickers));
-                const char *tsh = lv_textarea_get_text(id(ta_shares));
-                id(g_tickers_raw) = "";
-                if (tsym != nullptr) id(g_tickers_raw) = std::string(tsym);
-                id(g_shares_raw) = "";
-                if (tsh != nullptr) id(g_shares_raw) = std::string(tsh);
-                const char *tcur = lv_textarea_get_text(id(ta_currency));
-                id(g_currency_code) = tcur ? std::string(tcur) : std::string("USD");
-                for (size_t ci = 0; ci < id(g_currency_code).size(); ci++) {
-                  char c = id(g_currency_code)[ci];
-                  if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
-                }
-                if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
+          - light.turn_off: display_backlight    
           - lvgl.page.show:
               id: page_info
-              animation: OUT_BOTTOM
-              time: 250ms
+          - delay: 250ms  
+          - light.turn_on: display_backlight    
       on_swipe_down:
         then:
           - lambda: |-
                 lv_indev_wait_release(lv_indev_get_act());
-                const char *tsym = lv_textarea_get_text(id(ta_tickers));
-                const char *tsh = lv_textarea_get_text(id(ta_shares));
-                id(g_tickers_raw) = "";
-                if (tsym != nullptr) id(g_tickers_raw) = std::string(tsym);
-                id(g_shares_raw) = "";
-                if (tsh != nullptr) id(g_shares_raw) = std::string(tsh);
-                const char *tcur = lv_textarea_get_text(id(ta_currency));
-                id(g_currency_code) = tcur ? std::string(tcur) : std::string("USD");
-                for (size_t ci = 0; ci < id(g_currency_code).size(); ci++) {
-                  char c = id(g_currency_code)[ci];
-                  if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
-                }
-                if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
           - lvgl.page.show:
               id: page_quote
-              animation: OUT_TOP
-              time: 250ms
       widgets:
         - image:
             src: img_infoback
@@ -2306,6 +2450,13 @@ lvgl:
             y: 34
             width: 480
             height: 48
+            cursor:
+              bg_color: 0xffffff   
+              bg_opa: TRANSP        
+              border_width: 0
+              border_color: 0x161614
+              focused:
+                bg_opa: COVER              
             one_line: true
             text: ""
             placeholder_text: "TSLA SPCX ..."
@@ -2318,16 +2469,22 @@ lvgl:
             border_color: 0x3a3834
             radius: 10
             pad_all: 10
+            on_ready:
+              if:
+                condition:
+                  lambda: |-
+                    const char *tsym = lv_textarea_get_text(id(ta_tickers));
+                    std::string new_val = (tsym != nullptr) ? std::string(tsym) : "";
+                    if (id(g_tickers_raw) == new_val) {
+                      return false;
+                    }
+                    id(g_tickers_raw) = new_val;
+                    return true;
+                then:
+                  - script.execute: get_tickers
             on_focus:
               then:
-                - lambda: |-
-                    //ESP_LOGD("keyboard_debug", "ta_tickers focus: before show hidden=%d",
-                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
-                    lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
                 - lvgl.widget.show: setup_kb
-                - lambda: |-
-                    //ESP_LOGD("keyboard_debug", "ta_tickers focus: after show hidden=%d",
-                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
                 - lvgl.keyboard.update:
                     id: setup_kb
                     textarea: ta_tickers
@@ -2344,8 +2501,15 @@ lvgl:
             y: 100
             width: 366
             height: 48
+            cursor:
+              bg_color: 0xffffff   
+              bg_opa: TRANSP        
+              border_width: 1      
+              border_color: 0x161614
+              focused:
+                bg_opa: COVER              
             one_line: true
-            text: "626 0"
+            text: ""
             placeholder_text: "100 0 ..."
             accepted_chars: "0123456789., "
             max_length: 32
@@ -2356,16 +2520,22 @@ lvgl:
             border_color: 0x3a3834
             radius: 10
             pad_all: 10
+            on_ready:
+              if:
+                condition:
+                  lambda: |-
+                    const char *tsh = lv_textarea_get_text(id(ta_shares));
+                    std::string new_val = (tsh != nullptr) ? std::string(tsh) : "";
+                    if (id(g_shares_raw) == new_val) {
+                      return false;
+                    }
+                    id(g_shares_raw) = new_val;
+                    return true;
+                then:
+                  - script.execute: get_shares               
             on_focus:
               then:
-                - lambda: |-
-                    //ESP_LOGD("keyboard_debug", "ta_shares focus: before show hidden=%d",
-                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
-                    lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
                 - lvgl.widget.show: setup_kb
-                - lambda: |-
-                    //ESP_LOGD("keyboard_debug", "ta_shares focus: after show hidden=%d",
-                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
                 - lvgl.keyboard.update:
                     id: setup_kb
                     textarea: ta_shares
@@ -2382,6 +2552,13 @@ lvgl:
             y: 166
             width: 80
             height: 52
+            cursor:
+              bg_color: 0xffffff   
+              bg_opa: TRANSP        
+              border_width: 1      
+              border_color: 0x161614
+              focused:
+                bg_opa: COVER              
             one_line: true
             text: "USD"
             placeholder_text: "USD"
@@ -2394,48 +2571,89 @@ lvgl:
             border_color: 0x3a3834
             radius: 10
             pad_all: 8
+            on_ready:
+              if:
+                condition:
+                  lambda: |-
+                    const char *tcur = lv_textarea_get_text(id(ta_currency));
+                    std::string new_val = (tcur != nullptr && tcur[0] != '\0') ? std::string(tcur) : "USD";
+                    std::transform(new_val.begin(), new_val.end(), new_val.begin(), ::toupper);
+                    if (id(g_currency_code) == new_val) {
+                      return false; 
+                    }
+                    id(g_currency_code) = new_val;
+                    return true;
+                then:
+                  - script.execute: fetch_currency
             on_focus:
               then:
-                - lambda: |-
-                    //ESP_LOGD("keyboard_debug", "ta_currency focus: before show hidden=%d",
-                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
-                    lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
                 - lvgl.widget.show: setup_kb
-                - lambda: |-
-                    //ESP_LOGD("keyboard_debug", "ta_currency focus: after show hidden=%d",
-                    //         (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN));
                 - lvgl.keyboard.update:
                     id: setup_kb
                     textarea: ta_currency
                     mode: TEXT_UPPER
         - label:
-            text: "Relay1"
+            text: "Display rotation"
             text_font: font_ui
             text_color: 0x8a8780
-            x: 240
+            x: 216
             y: 176
-        - switch:
-            id: sw_relay1
-            x: 310
-            y: 172
-            width: 80
-            height: 40
-            state:
-              checked: true   
-            on_value:
-              - if:
-                  condition:
-                    lambda: 'return !id(g_relay1);'
-                  then:
-                    - lambda: 'id(g_relay1) = true;'
-                    - if:
-                        condition:
-                          lambda: 'return x;' # 'x' az LVGL kapcsoló aktuális állapota (true/false)
-                        then:
-                          - switch.turn_on: ha_relay1
-                        else:
-                          - switch.turn_off: ha_relay1
-                    - lambda: 'id(g_relay1) = false;'
+        - dropdown:
+            id: dd_rotation
+            x: 380
+            y: 166
+            width: 100
+            height: 52
+            text_font: montserrat_24
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            radius: 10
+            dir: BOTTOM
+            options:
+              - "0°"
+              - "90°"
+              - "180°"
+              - "270°"
+            selected_index: 0
+            styles:
+            dropdown_list:
+              bg_color: 0x161614
+              border_color: 0x3a3834
+              border_width: 2
+              radius: 10
+              text_font: font_setup
+              text_color: 0xf2efe8     
+            on_change:
+              then:
+                - if:
+                    condition:
+                      lambda: 'return !id(g_rotation_busy);'
+                    then:
+                      - lambda: |-
+                          int idx = (int) x;
+                          int deg = 0;
+                          if (idx == 1) deg = 90;
+                          else if (idx == 2) deg = 180;
+                          else if (idx == 3) deg = 270;
+                          id(g_rotation) = deg;
+                          lv_display_rotation_t lvrot = LV_DISPLAY_ROTATION_0;
+                          if (deg == 90) {
+                            lvrot = LV_DISPLAY_ROTATION_90;
+                          } else if (deg == 180) {
+                            lvrot = LV_DISPLAY_ROTATION_180;
+                          } else if (deg == 270) {
+                            lvrot = LV_DISPLAY_ROTATION_270;
+                          }
+                
+                          lv_display_t *disp = lv_display_get_default();
+                          if (disp != nullptr) {
+                            lv_display_set_rotation(disp, lvrot);
+                          } 
+                      - lvgl.page.show: 
+                          id: page_setup
+                      - script.execute: apply_rotation
         - label:
             text: "Backlight"
             text_font: font_ui
@@ -2457,19 +2675,122 @@ lvgl:
                 - light.turn_on:
                     id: display_backlight
                     brightness: !lambda 'return x / 100.0f;'
+        - label:
+            text: "Relay1"
+            text_font: font_ui
+            text_color: 0x8a8780
+            x: 0
+            y: 294
+        - switch:
+            id: sw_relay1
+            x: 82
+            y: 290
+            width: 80
+            height: 40
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            state:
+              checked: true   
+            on_value:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_relay1);'
+                  then:
+                    - lambda: 'id(g_relay1) = true;'
+                    - if:
+                        condition:
+                          lambda: 'return x;' # 'x' az LVGL kapcsoló aktuális állapota (true/false)
+                        then:
+                          - switch.turn_on: ha_relay1
+                        else:
+                          - switch.turn_off: ha_relay1
+                    - lambda: 'id(g_relay1) = false;'
+        - label:
+            text: "Relay2"
+            text_font: font_ui
+            text_color: 0x8a8780
+            x: 0
+            y: 344
+        - switch:
+            id: sw_relay2
+            x: 82
+            y: 340
+            width: 80
+            height: 40
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            state:
+              checked: true   
+            on_value:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_relay2);'
+                  then:
+                    - lambda: 'id(g_relay2) = true;'
+                    - if:
+                        condition:
+                          lambda: 'return x;' # 'x' az LVGL kapcsoló aktuális állapota (true/false)
+                        then:
+                          - switch.turn_on: ha_relay2
+                        else:
+                          - switch.turn_off: ha_relay2
+                    - lambda: 'id(g_relay2) = false;'
+        - label:
+            text: "Relay3"
+            text_font: font_ui
+            text_color: 0x8a8780
+            x: 0
+            y: 394
+        - switch:
+            id: sw_relay3
+            x: 82
+            y: 390
+            width: 80
+            height: 40
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            state:
+              checked: true   
+            on_value:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_relay3);'
+                  then:
+                    - lambda: 'id(g_relay3) = true;'
+                    - if:
+                        condition:
+                          lambda: 'return x;' # 'x' az LVGL kapcsoló aktuális állapota (true/false)
+                        then:
+                          - switch.turn_on: ha_relay3
+                        else:
+                          - switch.turn_off: ha_relay3
+                    - lambda: 'id(g_relay3) = false;'
         - button:
             id: restart_button
-            x: 16
-            y: 300
-            width: 140
+            x: 366
+            y: 420
+            width: 110
             height: 52
             radius: 10
             bg_color: 0x800000
+            border_width: 0
+            border_color: 0x400000
+            shadow_width: 0
+            focused:
+              shadow_width: 0
+            pressed:
+              shadow_width: 0            
             widgets:
               - label:
                   align: CENTER
                   text: "Restart"
-                  text_font: font_ui
+                  text_font: font_setup
                   text_color: 0xf0f0f0
             on_click:
               then:
@@ -2482,38 +2803,65 @@ lvgl:
             height: 180
             textarea: ta_tickers
             mode: TEXT_UPPER
+            bg_color: 0x161614
+            text_color: 0xf0f0f0
+            text_font: montserrat_24
+            border_width: 0
+            items:
+              bg_color: 0x2a2824
+              text_color: 0xf2efe8
+              text_font: montserrat_24
+              radius: 6
+              pressed:
+                bg_color: 0x3a3834
+                text_color: 0xffffff
+              checked:
+                bg_color: 0x4a4844
+                text_color: 0xffffff
+            on_cancel:
+              then:
+                - lambda: |-
+                    lv_obj_clear_state(id(ta_tickers), LV_STATE_FOCUSED);
+                    lv_obj_clear_state(id(ta_shares), LV_STATE_FOCUSED);
+                    lv_obj_clear_state(id(ta_currency), LV_STATE_FOCUSED);
+                - lvgl.widget.focus: backlight_slider
+                - lvgl.widget.hide: setup_kb            
             on_ready:
               then:
                 - lambda: |-
-                      ESP_LOGD("keyboard_debug", "setup_kb on_ready: hidden=%d, w=%d h=%d x=%d y=%d",
-                               (int) lv_obj_has_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN),
-                               (int) lv_obj_get_width(id(setup_kb).obj), (int) lv_obj_get_height(id(setup_kb).obj),
-                               (int) lv_obj_get_x(id(setup_kb).obj), (int) lv_obj_get_y(id(setup_kb).obj));
-                      lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
-                      lv_obj_set_align(id(setup_kb).obj, LV_ALIGN_BOTTOM_MID);
-                      lv_obj_set_pos(id(setup_kb).obj, 0, 0);
-                      lv_obj_move_foreground(id(setup_kb).obj);
-                      const char *tsym = lv_textarea_get_text(id(ta_tickers));
-                      const char *tsh = lv_textarea_get_text(id(ta_shares));
-                      id(g_tickers_raw) = "";
-                      if (tsym != nullptr) id(g_tickers_raw) = std::string(tsym);
-                      id(g_shares_raw) = "";
-                      if (tsh != nullptr) id(g_shares_raw) = std::string(tsh);
-                      const char *tcur = lv_textarea_get_text(id(ta_currency));
-                      id(g_currency_code) = tcur ? std::string(tcur) : std::string("USD");
-                      for (size_t ci = 0; ci < id(g_currency_code).size(); ci++) {
-                        char c = id(g_currency_code)[ci];
-                        if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
-                      }
-                      if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
-                - script.execute: get_tickers_shares
-                - script.execute: fetch_currency
-#                - script.execute: fetch_all
-                - lvgl.page.show:
-                    id: page_quote
-                    animation: OUT_BOTTOM
-                    time: 250ms
+                    lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_set_align(id(setup_kb).obj, LV_ALIGN_BOTTOM_MID);
+                    lv_obj_set_pos(id(setup_kb).obj, 0, 0);
+                    lv_obj_move_foreground(id(setup_kb).obj);
+                - lvgl.widget.focus: backlight_slider
+                - lvgl.widget.hide: setup_kb            
 
+select:
+  - platform: template
+    name: "Display rotation"
+    id: ha_rotation
+    icon: "mdi:screen-rotation"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: "0°"
+    options:
+      - "0°"
+      - "90°"
+      - "180°"
+      - "270°"
+    set_action:
+      - if:
+          condition:
+            lambda: 'return !id(g_rotation_busy);'
+          then:
+            - lambda: |-
+                int deg = 0;
+                if (x == "90°") deg = 90;
+                else if (x == "180°") deg = 180;
+                else if (x == "270°") deg = 270;
+                id(g_rotation) = deg;
+#            - script.execute: apply_rotation
 
 text:
   - platform: template
@@ -2564,7 +2912,7 @@ text:
     icon: "mdi:counter"
     optimistic: true
     restore_value: true
-    initial_value: "626 0"
+    initial_value: "100 0"
     min_length: 0
     max_length: 32
     mode: text
@@ -2581,13 +2929,13 @@ sensor:
   - platform: internal_temperature
     name: "CPU Temperature"
     id: cpu_temperature
-    update_interval: 5s
+    update_interval: 30s
     entity_category: diagnostic
 
   - platform: wifi_signal
     name: "WiFi Signal"
     id: wifi_signal_db
-    update_interval: 10s
+    update_interval: 15s
     entity_category: diagnostic
 
   - platform: template
@@ -2829,3 +3177,55 @@ switch:
                 state:
                   checked: false
             - lambda: 'id(g_relay1) = false;'
+  - platform: gpio
+    pin: 2
+    id: ha_relay2
+    name: 'Relay 2'        
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return !id(g_relay1);'
+          then:
+            - lambda: 'id(g_relay2) = true;'
+            - lvgl.widget.update:
+                id: sw_relay2
+                state:
+                  checked: true
+            - lambda: 'id(g_relay2) = false;'
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return !id(g_relay1);'
+          then:
+            - lambda: 'id(g_relay2) = true;'
+            - lvgl.widget.update:
+                id: sw_relay2
+                state:
+                  checked: false
+            - lambda: 'id(g_relay2) = false;'              
+  - platform: gpio
+    pin: 1
+    id: ha_relay3
+    name: 'Relay 3'        
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return !id(g_relay1);'
+          then:
+            - lambda: 'id(g_relay3) = true;'
+            - lvgl.widget.update:
+                id: sw_relay3
+                state:
+                  checked: true
+            - lambda: 'id(g_relay3) = false;'
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return !id(g_relay1);'
+          then:
+            - lambda: 'id(g_relay3) = true;'
+            - lvgl.widget.update:
+                id: sw_relay3
+                state:
+                  checked: false
+            - lambda: 'id(g_relay3) = false;'                            
