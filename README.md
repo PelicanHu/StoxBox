@@ -58,6 +58,7 @@ At minimum, keep these files together:
 ```
 
 `logo.png` and `back.png` are referenced by the ESPHome configuration and are required when compiling the firmware.
+You can find a couple of other background images in this repo.
 
 ## Configuration
 
@@ -85,7 +86,7 @@ The default configuration includes:
 substitutions:
   device_name: stoxbox
   poll_seconds: "60s"
-  app_version: "0.2"
+  app_version: "0.3"
   ha_topic: "stoxbox/quote"
 ```
 
@@ -93,7 +94,7 @@ The default ticker and portfolio configuration is stored in persistent ESPHome g
 
 ```text
 Ticker symbols: TSLA SPCX
-Shares:         626 0
+Shares:         100 0
 Currency:       USD
 ```
 
@@ -126,13 +127,14 @@ The Setup screen provides:
 - Ticker list
 - Share list
 - Currency
-- Relay control
+- Relay control for the the 2x4 connector (IO40, IO2, IO1)
 - Display backlight control
+- Display orientation setting
 - **Restart** button
 
 The Restart button performs a hardware/software reboot of the ESP32-S3 using the ESP-IDF restart function.
 
-Swipe gestures are also used for navigation between the Quote, Info and Setup pages.
+Swipe up and down gestures used for navigation between the Quote, Info and Setup pages.
 
 ## Market data
 
@@ -147,6 +149,7 @@ includePrePost=true
 ```
 
 The dashboard uses this data to display the current price, change, daily high/low and intraday chart.
+Swipe right and left to select the next or previous asset.
 
 Because the project depends on an external market-data service, availability and data quality are outside the control of this project.
 
@@ -157,8 +160,9 @@ The device exposes configurable values through the ESPHome native API, including
 - Currency
 - Ticker list
 - Share list
-- Relay
+- Relays
 - Display/backlight state
+- Display orientation
 - Device information and status entities
 
 The API is protected with an encryption key from `secrets.yaml`.
