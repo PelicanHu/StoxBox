@@ -206,11 +206,9 @@ The software distinguishes between:
 
 The configuration also contains a list of US market holidays and early-close dates. Update these dates as necessary when maintaining the project.
 
-## License
+## MIT License
 
-No license is currently specified for this project.
 
-If you publish the repository publicly, consider adding an appropriate open-source license (for example MIT, Apache-2.0, or GPL-3.0) according to how you want others to use the project.
 
 ## Disclaimer
 
