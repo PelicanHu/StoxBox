@@ -10,7 +10,7 @@
 substitutions:
   device_name: stoxbox
   poll_seconds: "60s"
-  app_version: "0.31"
+  app_version: "0.40"
   ha_topic: "stoxbox/quote"
   
 esphome:
@@ -32,8 +32,6 @@ esphome:
     - priority: 800.0  # This is where all hardware initialization of vital components is executed. For example setting switches to their initial state.
       then:
         - lambda: |-
-            // LVGL is responsible for display + touchscreen rotation.
-            // The persisted value is applied after LVGL has initialized.
             lv_label_set_text(id(lbl_appname), "StoxBox v${app_version}");
             lv_obj_clear_flag(id(lbl_appname), LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(id(lbl_author), LV_OBJ_FLAG_HIDDEN);            
@@ -160,13 +158,12 @@ api:
 ota:
   - platform: esphome
     on_begin:
-#      - lvgl.page.show: 
-#          id: page_splash
-      - light.turn_off:
-          id: display_backlight
-          transition_length: 0s
-      - lambda: "id(display_backlight).loop();"
-
+      - lvgl.page.show: 
+          id: page_splash
+      - lambda: |-
+          lv_obj_clear_flag(id(ota_box), LV_OBJ_FLAG_HIDDEN);
+          lv_timer_handler();
+          
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
@@ -184,9 +181,6 @@ time:
     on_time_sync:
       then:
         - script.execute: paint_session
-#        - script.execute: fetch_all
-
-# mqtt: optional
 
 http_request:
   useragent: StoxBox/1.0
@@ -275,20 +269,20 @@ touchscreen:
 image:
   - platform: file
     file: "logo.png"
-    id: img_applogo
+    id: img_logo
     type: RGB565
     resize: 480x480
   - platform: file
     file: "back.png"
-    id: img_infoback
+    id: img_back
     type: RGB565
     resize: 480x480
 
 font:
   - file: "gfonts://Google Sans"
     id: font_price
-    size: 100
-    glyphs: "0123456789., -"
+    size: 106
+    glyphs: "0123456789., -OTA"
   - file: "gfonts://Google Sans"
     id: font_chg
     size: 32
@@ -995,7 +989,7 @@ script:
             }
             const int width = 480;
             int height = 196;
-            if (id(g_show_value) && sh > 0) height = 86;
+            if (id(g_show_value) && sh > 0) height = 108;
 
             // g_spark format: day_seconds|close,day_seconds|close,...
             // day_seconds = local seconds from 00:00.
@@ -1109,10 +1103,10 @@ script:
                   (vals[k] - mn) / span;
 
                 int y =
-                  (int)(4 + (1.0f - t) * height);
+                  (int)( (1.0f - t) * height);
 
                 if (y < 0) y = 0;
-                if (y > height + 4) y = height + 4;
+                if (y > height ) y = height ;
 
                 pts[k].x = (lv_coord_t)x;
                 pts[k].y = (lv_coord_t)y;
@@ -1142,7 +1136,7 @@ script:
                   (prev_close - mn) / span;
 
                 int prev_y =
-                  (int)(4 + (1.0f - prev_t) * height);
+                  (int)( (1.0f - prev_t) * height);
 
                 prev_pts[0].x = 0;
                 prev_pts[0].y = prev_y;
@@ -1197,7 +1191,7 @@ script:
                 session_pts[0].y = 0;
 
                 session_pts[1].x = separator_x;
-                session_pts[1].y = height + 4;
+                session_pts[1].y = height;
 
                 lv_line_set_points(
                   id(session_separator).obj,
@@ -1652,7 +1646,7 @@ interval:
   - interval: 1s
     then:
       - lambda: |-
-          if (lv_scr_act() != id(page_info).obj {
+          if (lv_scr_act() != id(page_info).obj) {
             return; 
           }
           // ------------------------------------------------------------
@@ -1799,7 +1793,7 @@ lvgl:
       bg_color: 0x000040
       widgets:
         - image:
-            src: img_applogo
+            src: img_logo
             x: 0
             y: 0
             width: 480
@@ -1812,7 +1806,6 @@ lvgl:
             x: 20
             y: 20
             width: 240
-            hidden: true
         - label:
             id: lbl_author
             text: "by pel.hu"
@@ -1820,7 +1813,33 @@ lvgl:
             text_color: 0xe0e0e0  
             x: 336
             y: 435
+        - obj:
+            id: ota_box
+            x: 80
+            y: 150
+            width: 320
+            height: 180
+            radius: 10
+            bg_color: 0x10261c
+            border_width: 0
+            border_color: 0x3dcf8e
+            bg_opa: 50%    
+            border_opa: 50%
+            pad_all: 0
             hidden: true
+            widgets:
+              - label:
+                  text: "OTA"
+                  text_font: font_price
+                  text_color: 0xffffff  
+                  align: TOP_MID
+                  y: 5                 
+              - label:
+                  text: "update"
+                  text_font: font_value
+                  text_color: 0xffffff  
+                  align: TOP_MID
+                  y: 108               
     - id: page_info
       bg_color: 0x050504
       on_swipe_up:
@@ -1842,7 +1861,7 @@ lvgl:
           - light.turn_on: display_backlight
       widgets:
         - image:
-            src: img_infoback
+            src: img_back
             x: 0
             y: 0
             width: 480
@@ -2188,6 +2207,12 @@ lvgl:
               id(g_show_value) = !id(g_show_value);
           - script.execute: paint_active    
       widgets:
+        - image:
+            src: img_back
+            x: 0
+            y: 0
+            width: 480
+            height: 480
         - label:
             id: lbl_loading
             text: "LOADING..."
@@ -2214,7 +2239,8 @@ lvgl:
             width: 160
             height: 40
             radius: 10
-            bg_color: 0x10261c
+            bg_color: 0x224422
+            bg_opa: 50%
             border_width: 1
             border_color: 0x3dcf8e
             pad_all: 0
@@ -2234,7 +2260,7 @@ lvgl:
             width: 480
             long_mode: CLIP
             x: 0
-            y: 60
+            y: 56
         - label:
             id: lbl_chg
             text: ""
@@ -2284,7 +2310,7 @@ lvgl:
         - line:
             id: spark_line
             x: 0
-            y: 250
+            y: 244
             width: 480
             height: 200
             line_width: 3
@@ -2393,7 +2419,7 @@ lvgl:
               id: page_quote
       widgets:
         - image:
-            src: img_infoback
+            src: img_back
             x: 0
             y: 0
             width: 480
@@ -2789,7 +2815,6 @@ select:
     icon: "mdi:screen-rotation"
     entity_category: config
     optimistic: true
-    # g_rotation is the single persisted source of truth.
     initial_option: "0°"
     options:
       - "0°"
