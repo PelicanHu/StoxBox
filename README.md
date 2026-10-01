@@ -25,6 +25,32 @@ It displays stock prices, daily changes, market status and an intraday chart, wi
 - Device information page
 - **Restart button on the Setup screen**
 
+## Screenshots
+
+### Quote screen
+
+![StoxBox Quote screen](page_quote.png)
+
+The main Quote screen displays the selected ticker, current price, daily change, market status and intraday chart.
+
+### Quote screen with portfolio value
+
+![StoxBox Quote screen with portfolio value](page_quote_val.png)
+
+When share quantities are configured, the portfolio value can also be displayed together with the current market data.
+
+### Info screen
+
+![StoxBox Info screen](page_info.png)
+
+The Info screen provides device and system information, including firmware version, network status, memory and SD card information.
+
+### Setup screen
+
+![StoxBox Setup screen](page_setup.png)
+
+The Setup screen allows the main device settings to be changed directly from the touchscreen, including tickers, share quantities, currency, relay control, backlight and display orientation. A Restart button is also available.
+
 ## Hardware
 
 The configuration targets:
@@ -212,7 +238,25 @@ The configuration also contains a list of US market holidays and early-close dat
 
 ## MIT License
 
+Copyright (c) 2026 pel.hu
 
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ## Disclaimer
 
