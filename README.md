@@ -153,7 +153,7 @@ The Setup screen provides:
 - Ticker list
 - Share list
 - Currency
-- Relay control for the the 2x4 connector (IO40, IO2, IO1)
+- Relay control for the 2x4 pin connector (IO40, IO2, IO1)
 - Display backlight control
 - Display orientation setting
 - **Restart** button
