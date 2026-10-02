@@ -36,12 +36,14 @@ It displays stock prices, daily changes, market status and an intraday chart, wi
 ![StoxBox Quote screen](page_quote.png)
 
 The main Quote screen displays the selected ticker, current price, daily change, market status and intraday chart.
+Swipe left for the next or swipe right for the previous ticker.
 
 ### Quote screen with portfolio value
 
 ![StoxBox Quote screen with portfolio value](page_quote_val.png)
 
 When share quantities are configured, the portfolio value can also be displayed together with the current market data.
+Double tap the screen to turn on/off showing the value.
 
 ### Info screen
 
