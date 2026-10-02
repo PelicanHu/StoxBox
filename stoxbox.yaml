@@ -10,7 +10,7 @@
 substitutions:
   device_name: stoxbox
   poll_seconds: "60s"
-  app_version: "0.42"
+  app_version: "0.50"
   ha_topic: "stoxbox/quote"
   
 esphome:
@@ -177,12 +177,22 @@ ota:
       - lvgl.page.show: 
           id: page_splash
       - lambda: |-
+          id(ota_progress) = 0;
           lv_obj_clear_flag(id(ota_box), LV_OBJ_FLAG_HIDDEN);
           lv_timer_handler();
-#      - light.turn_off:
-#          id: display_backlight
-#          transition_length: 0s
-#      - lambda: "id(display_backlight).loop();"
+    on_end:
+      then:
+        - light.turn_off: display_backlight      
+    on_progress:
+      then:
+        - switch.toggle: ha_relay1
+        - lambda: |-
+            id(ota_progress) = x;  
+            lv_bar_set_value(id(ota_progress_bar),(int)x+5,LV_ANIM_OFF);
+            if (x >= 94.0f) {
+              id(backlight_output).set_level(0.0f);
+            }
+            lv_timer_handler();
 
 wifi:
   ssid: !secret wifi_ssid
@@ -670,11 +680,42 @@ globals:
     type: int
     restore_value: no
     initial_value: "0"
-
+  - id: g_fetch_ms_0
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: g_fetch_ms_1
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: g_fetch_ms_2
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: g_fetch_ms_3
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: g_fetch_ms_4
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: g_fetch_ms_5
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: ota_progress
+    type: float
+    restore_value: no
+    initial_value: "0"
+    
 script:
   - id: restart_device
     mode: restart
     then:
+      - lambda: |-
+          id(backlight_output).set_level(0.0f);
+      - delay: 500ms  
       - lambda: |-
           esp_restart();
 
@@ -980,7 +1021,7 @@ script:
                 lv_obj_set_width(id(status_box), 100);
               }
             }
-            lv_obj_t *tickers[6] = { id(dot_0), id(dot_1), id(dot_2), id(dot_3), id(dot_4), id(dot_5) };
+            lv_obj_t *tickers[6] = { id(ticker_0), id(ticker_1), id(ticker_2), id(ticker_3), id(ticker_4), id(ticker_5) };
             const char *syms[6] = { id(g_sym_0).c_str(), id(g_sym_1).c_str(), id(g_sym_2).c_str(), 
                                     id(g_sym_3).c_str(), id(g_sym_4).c_str(), id(g_sym_5).c_str() };
             float chgs[6] = { id(g_chg_0), id(g_chg_1), id(g_chg_2), id(g_chg_3), id(g_chg_4), id(g_chg_5) };
@@ -994,7 +1035,7 @@ script:
               } else {
                 lv_obj_clear_flag(tickers[d], LV_OBJ_FLAG_HIDDEN);
                 lv_label_set_text(tickers[d], syms[d]);
-                lv_obj_set_pos(tickers[d], start_x + d * cell_w, 456);
+                lv_obj_set_pos(tickers[d], start_x + d * cell_w, 453);
                 lv_obj_set_width(tickers[d], cell_w);
                 lv_obj_set_height(tickers[d], 28);
                 lv_obj_set_style_text_align(tickers[d], LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
@@ -1317,6 +1358,34 @@ script:
             id(g_premarket) = pre;
             id(g_aftermarket) = after;
       - script.execute: paint_active
+  - id: fetch_current_if_due
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (lv_scr_act() != id(page_quote).obj) 
+                return false;
+                
+              if (!(id(g_market_open) || id(g_premarket) || id(g_aftermarket)))
+                return false;
+  
+              uint32_t last = 0;
+              int i = id(g_index);
+  
+              if (i == 0) last = id(g_fetch_ms_0);
+              else if (i == 1) last = id(g_fetch_ms_1);
+              else if (i == 2) last = id(g_fetch_ms_2);
+              else if (i == 3) last = id(g_fetch_ms_3);
+              else if (i == 4) last = id(g_fetch_ms_4);
+              else if (i == 5) last = id(g_fetch_ms_5);
+  
+              return (last == 0 || (uint32_t)(millis() - last) >= 60000UL);
+          then:
+            - script.execute:
+                id: fetch_one
+                slot: !lambda |-
+                  return id(g_index);
   - id: fetch_one
     mode: queued
     parameters:
@@ -1327,15 +1396,47 @@ script:
       - if:
           condition:
             lambda: |-
-                int i = id(g_fetch_i);
-                if (i < 0 || i >= id(g_count)) return false;
-                std::string sym = id(g_sym_0);
-                if (i == 1) sym = id(g_sym_1);
-                if (i == 2) sym = id(g_sym_2);
-                if (i == 3) sym = id(g_sym_3);
-                if (i == 4) sym = id(g_sym_4);
-                if (i == 5) sym = id(g_sym_5);
-                return !sym.empty();
+              int i = id(g_fetch_i);
+
+              if (i < 0 || i >= id(g_count)) {
+                return false;
+              }
+      
+              // Ticker neve
+              std::string sym = id(g_sym_0);
+              if (i == 1) sym = id(g_sym_1);
+              if (i == 2) sym = id(g_sym_2);
+              if (i == 3) sym = id(g_sym_3);
+              if (i == 4) sym = id(g_sym_4);
+              if (i == 5) sym = id(g_sym_5);
+      
+              if (sym.empty()) {
+                return false;
+              }
+      
+              // Legalább 60 másodperc teljen el két lekérés között.
+              uint32_t now = millis();
+              uint32_t last = 0;
+      
+              if (i == 0) last = id(g_fetch_ms_0);
+              else if (i == 1) last = id(g_fetch_ms_1);
+              else if (i == 2) last = id(g_fetch_ms_2);
+              else if (i == 3) last = id(g_fetch_ms_3);
+              else if (i == 4) last = id(g_fetch_ms_4);
+              else if (i == 5) last = id(g_fetch_ms_5);
+      
+              if (last != 0 && (uint32_t)(now - last) < 60000UL) {
+                ESP_LOGD(
+                  "fetch_one",
+                  "skip %s: %lu ms since last fetch",
+                  sym.c_str(),
+                  (unsigned long)(now - last)
+                );
+                return false;
+              }
+      
+              return true;
+
           then:
             - http_request.get:
                 url: !lambda |-
@@ -1568,12 +1669,19 @@ script:
                               }
                               if (!spark.empty()) {
                                 if (i == 0) id(g_spark_0) = spark;
-                                if (i == 1) id(g_spark_1) = spark;
-                                if (i == 2) id(g_spark_2) = spark;
-                                if (i == 3) id(g_spark_3) = spark;
-                                if (i == 4) id(g_spark_4) = spark;
-                                if (i == 5) id(g_spark_5) = spark;
+                                else if (i == 1) id(g_spark_1) = spark;
+                                else if (i == 2) id(g_spark_2) = spark;
+                                else if (i == 3) id(g_spark_3) = spark;
+                                else if (i == 4) id(g_spark_4) = spark;
+                                else if (i == 5) id(g_spark_5) = spark;
                               }
+                              uint32_t now = millis();
+                              if (i == 0) id(g_fetch_ms_0) = now;
+                              else if (i == 1) id(g_fetch_ms_1) = now;
+                              else if (i == 2) id(g_fetch_ms_2) = now;
+                              else if (i == 3) id(g_fetch_ms_3) = now;
+                              else if (i == 4) id(g_fetch_ms_4) = now;
+                              else if (i == 5) id(g_fetch_ms_5) = now;
                           - script.execute: paint_active
 
                         else:
@@ -1670,62 +1778,99 @@ script:
 interval:
   - interval: 1s
     then:
+      - if:
+          condition:
+            lambda: |-
+              return lv_scr_act() == id(page_quote).obj;
+          then:
+            - script.execute: fetch_current_if_due
       - lambda: |-
-          if (lv_scr_act() != id(page_info).obj) {
-            return; 
+          if (lv_scr_act() == id(page_quote).obj) {
+            int ts = id(g_ts_0);
+            int i=id(g_index);
+            if (i == 1) ts = id(g_ts_1);
+            if (i == 2) ts = id(g_ts_2);
+            if (i == 3) ts = id(g_ts_3);
+            if (i == 4) ts = id(g_ts_4);
+            if (i == 5) ts = id(g_ts_5);
+            if (ts > 0) {
+              char buf[72];
+              time_t tt = (time_t) ts;
+              struct tm tmv;
+              localtime_r(&tt, &tmv);
+              time_t nowt = ::time(nullptr);
+              int age = (int) (nowt - tt);
+              if (age < 0) age = 0;
+              char rel[24];
+              if (nowt < 100000) rel[0] = '\0';
+              else if (age < 60) snprintf(rel, sizeof(rel), "%d sec", age);
+              else if (age < 3600) snprintf(rel, sizeof(rel), "%d min", age / 60);
+              else if (age < 86400) snprintf(rel, sizeof(rel), "%d hour", age / 3600);
+              else snprintf(rel, sizeof(rel), "%d day", age / 86400);
+              snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d %s", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, rel);
+              lv_label_set_text(id(lbl_when), buf);
+            } else {
+              lv_label_set_text(id(lbl_when), "");
+            }
+          }  
+          if (lv_scr_act() == id(page_info).obj) {
+            // ------------------------------------------------------------
+            // SYSTEM INFO 1s
+            // ------------------------------------------------------------
+            char b[160];
+            auto t = id(sntp_time).now();
+  
+            // PSRAM: free / total
+            uint32_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            uint32_t psram_total = esp_psram_get_size();
+            snprintf(b, sizeof(b), "%lu/%lu kB",
+                     (unsigned long)(psram_free / 1024UL),
+                     (unsigned long)(psram_total / 1024UL));
+            lv_label_set_text(id(info_psram), b);
+  
+            // Free heap
+            uint32_t heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+            snprintf(b, sizeof(b), "%lu kB", (unsigned long)(heap / 1024UL));
+            lv_label_set_text(id(info_heap), b);
+  
+            float rssi = id(wifi_signal_db).state;
+            if (isnan(rssi)) snprintf(b, sizeof(b), "--");
+            else snprintf(b, sizeof(b), "%.0f dBm", rssi);
+            lv_label_set_text(id(info_rssi), b);
+  
+            // Uptime
+            uint32_t up = millis() / 1000UL;
+            uint32_t d = up / 86400UL;
+            uint32_t h = (up % 86400UL) / 3600UL;
+            uint32_t m = (up % 3600UL) / 60UL;
+            uint32_t sec = up % 60UL;
+            snprintf(b, sizeof(b), "%lu d %02lu:%02lu:%02lu",
+                     (unsigned long)d, (unsigned long)h,
+                     (unsigned long)m, (unsigned long)sec);
+            lv_label_set_text(id(info_uptime), b);
+  
+            // Time is already in America/New_York (EST/EDT) through SNTP.
+            if (t.is_valid()) {
+              snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
+                       t.year, t.month, t.day_of_month,
+                       t.hour, t.minute, t.second);
+            } else {
+              snprintf(b, sizeof(b), "--:--:--");
+            }
+            lv_label_set_text(id(info_time), b);
+  
+            // IP
+            std::string ip = id(wifi_ip_info).state;
+            snprintf(b, sizeof(b), "%s", ip.empty() ? "--" : ip.c_str());
+            lv_label_set_text(id(info_ip), b);      
           }
-          // ------------------------------------------------------------
-          // SYSTEM INFO 1s
-          // ------------------------------------------------------------
-          char b[160];
-          auto t = id(sntp_time).now();
-
-          // PSRAM: free / total
-          uint32_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-          uint32_t psram_total = esp_psram_get_size();
-          snprintf(b, sizeof(b), "%lu/%lu kB",
-                   (unsigned long)(psram_free / 1024UL),
-                   (unsigned long)(psram_total / 1024UL));
-          lv_label_set_text(id(info_psram), b);
-
-          // Free heap
-          uint32_t heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-          snprintf(b, sizeof(b), "%lu kB", (unsigned long)(heap / 1024UL));
-          lv_label_set_text(id(info_heap), b);
-
-          float rssi = id(wifi_signal_db).state;
-          if (isnan(rssi)) snprintf(b, sizeof(b), "--");
-          else snprintf(b, sizeof(b), "%.0f dBm", rssi);
-          lv_label_set_text(id(info_rssi), b);
-
-          // Uptime
-          uint32_t up = millis() / 1000UL;
-          uint32_t d = up / 86400UL;
-          uint32_t h = (up % 86400UL) / 3600UL;
-          uint32_t m = (up % 3600UL) / 60UL;
-          uint32_t sec = up % 60UL;
-          snprintf(b, sizeof(b), "%lu d %02lu:%02lu:%02lu",
-                   (unsigned long)d, (unsigned long)h,
-                   (unsigned long)m, (unsigned long)sec);
-          lv_label_set_text(id(info_uptime), b);
-
-          // Time is already in America/New_York (EST/EDT) through SNTP.
-          if (t.is_valid()) {
-            snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
-                     t.year, t.month, t.day_of_month,
-                     t.hour, t.minute, t.second);
-          } else {
-            snprintf(b, sizeof(b), "--:--:--");
-          }
-          lv_label_set_text(id(info_time), b);
-
-          // IP
-          std::string ip = id(wifi_ip_info).state;
-          snprintf(b, sizeof(b), "%s", ip.empty() ? "--" : ip.c_str());
-          lv_label_set_text(id(info_ip), b);      
   - interval: 30s
     then:
       - lambda: |-
+          //if (lv_scr_act() != id(page_info).obj) return; 
+          // ------------------------------------------------------------
+          // SYSTEM INFO 1s
+          // ------------------------------------------------------------
           char b[160];
           auto t = id(sntp_time).now();
           
@@ -1792,17 +1937,6 @@ interval:
           else snprintf(b, sizeof(b), "--");
           lv_label_set_text(id(info_channel), b);
 
-  - interval: ${poll_seconds}
-    then:
-      - script.execute: paint_session
-      - if:
-          condition:
-            lambda: return id(g_market_open) || id(g_premarket) || id(g_aftermarket);
-          then:
-            - script.execute:
-                id: fetch_one
-                slot: id(g_index)
-
 lvgl:
   # Keep LVGL paused during boot so the persisted rotation can be applied
   # before the splash screen is rendered for the first time.
@@ -1835,7 +1969,6 @@ lvgl:
             x: 20
             y: 20
             width: 240
-#            hidden: true
         - label:
             id: lbl_author
             text: "by pel.hu"
@@ -1843,13 +1976,12 @@ lvgl:
             text_color: 0xe0e0e0  
             x: 336
             y: 435
-#            hidden: true
         - obj:
             id: ota_box
             x: 80
             y: 150
             width: 320
-            height: 180
+            height: 230
             radius: 10
             bg_color: 0x10261c
             border_width: 0
@@ -1862,15 +1994,30 @@ lvgl:
               - label:
                   text: "OTA"
                   text_font: font_price
-                  text_color: 0xffffff  
+                  text_color: 0xffff00  
                   align: TOP_MID
                   y: 5                 
               - label:
                   text: "update"
                   text_font: font_value
-                  text_color: 0xffffff  
+                  text_color: 0xffff00 
                   align: TOP_MID
-                  y: 108               
+                  y: 108           
+              - bar:
+                  id: ota_progress_bar
+                  align: TOP_MID
+                  y: 185
+                  width: 280
+                  height: 20
+                  min_value: 0
+                  max_value: 100
+                  value: 0   
+                  bg_color: 0x26302B
+                  bg_opa: 30%
+                  indicator:
+                    bg_color: 0xffff00
+                    bg_opa: 100%
+                  
     - id: page_info
       bg_color: 0x050504
       on_swipe_up:
@@ -1921,7 +2068,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 34
+            y: 33
             width: 100
             height: 32
         - label:
@@ -2200,15 +2347,19 @@ lvgl:
       on_swipe_left:
         then:
           - lambda: |-
-                lv_indev_wait_release(lv_indev_get_act());
-                int n = id(g_count);
-                if (n > 1) {
-                  int i = id(g_index) + 1;
-                  if (i >= n) i = 0;
-                  id(g_index) = i;
-                  lv_label_set_text(id(lbl_name), "");
-                }
+              lv_indev_wait_release(lv_indev_get_act());
+              int n = id(g_count);
+              if (n > 1) {
+                int i = id(g_index) + 1;
+                if (i >= n) i = 0;
+                id(g_index) = i;
+                lv_label_set_text(id(lbl_name), "");
+              }
           - script.execute: paint_active
+          - lambda: |-  
+              lv_timer_handler();
+          - delay: 50ms    
+          - script.execute: fetch_current_if_due
       on_swipe_right:
         then:
           - lambda: |-
@@ -2221,6 +2372,10 @@ lvgl:
                   lv_label_set_text(id(lbl_name), "");
                 }
           - script.execute: paint_active
+          - lambda: |-  
+              lv_timer_handler();
+          - delay: 50ms    
+          - script.execute: fetch_current_if_due
       on_swipe_up:
         then:
           - lambda: |-
@@ -2261,7 +2416,7 @@ lvgl:
             text_color: 0xc8c4bc
             long_mode: DOT
             width: 320
-            x: 0
+            x: 2
             y: 8
         - obj:
             id: status_box
@@ -2290,7 +2445,7 @@ lvgl:
             text_color: 0xf2efe8
             width: 480
             long_mode: CLIP
-            x: 0
+            x: 2
             y: 56
         - label:
             id: lbl_chg
@@ -2298,7 +2453,7 @@ lvgl:
             text_font: font_chg
             text_color: 0x3dcf8e
             width: 480
-            x: 0
+            x: 1
             y: 164
         - label:
             id: lbl_hl
@@ -2312,7 +2467,7 @@ lvgl:
             text: ""
             text_font: font_ui
             text_color: 0x8a8780
-            x: 0
+            x: 4
             y: 210
         - line:
             id: session_separator
@@ -2354,74 +2509,74 @@ lvgl:
             text: "0 share"
             text_font: font_qty
             text_color: 0x8a8780
-            x: 0
+            x: 2
             y: 362
         - label:
             id: lbl_value
             text: " "
             text_font: font_value
             text_color: 0xd2cfc8
-            x: 0
+            x: 2
             y: 390
         - label:
-            id: dot_0
+            id: ticker_0
             text: ""
             text_font: font_ui
             text_color: 0x444444
             width: 96
             height: 28
             x: 0
-            y: 456
+            y: 454             # x,y will be changed in paint_active
             text_align: CENTER
         - label:
-            id: dot_1
+            id: ticker_1
             text: ""
             text_font: font_ui
             text_color: 0x444444
             width: 80
             height: 28
-            x: 0
-            y: 456
+            x: 0        
+            y: 454             # x,y will be changed in paint_active
             text_align: CENTER
         - label:
-            id: dot_2
+            id: ticker_2
             text: ""
             text_font: font_ui
             text_color: 0x444444
             width: 80
             height: 28
             x: 80
-            y: 456
+            y: 454             # x,y will be changed in paint_active
             text_align: CENTER
         - label:
-            id: dot_3
+            id: ticker_3
             text: ""
             text_font: font_ui
             text_color: 0x444444
             width: 80
             height: 28
             x: 160
-            y: 456
+            y: 454             # x,y will be changed in paint_active
             text_align: CENTER
         - label:
-            id: dot_4
+            id: ticker_4
             text: ""
             text_font: font_ui
             text_color: 0x444444
             width: 80
             height: 28
             x: 240
-            y: 456
+            y: 454             # x,y will be changed in paint_active
             text_align: CENTER
         - label:
-            id: dot_5
+            id: ticker_5
             text: ""
             text_font: font_ui
             text_color: 0x444444
             width: 80
             height: 28
             x: 320
-            y: 456
+            y: 454             # x,y will be changed in paint_active
             text_align: CENTER
     - id: page_setup
       skip: false
@@ -2459,13 +2614,13 @@ lvgl:
             text: "Ticker list"
             text_font: font_setup
             text_color: 0x8a8780
-            x: 0
+            x: 8
             y: 0
         - textarea:
             id: ta_tickers
-            x: 0
+            x: 8
             y: 34
-            width: 480
+            width: 464
             height: 48
             cursor:
               bg_color: 0xffffff   
@@ -2510,13 +2665,13 @@ lvgl:
             text: "Shares list"
             text_font: font_setup
             text_color: 0x8a8780
-            x: 0
+            x: 8
             y: 112
         - textarea:
             id: ta_shares
-            x: 114
+            x: 122
             y: 100
-            width: 366
+            width: 350
             height: 48
             cursor:
               bg_color: 0xffffff   
@@ -2561,7 +2716,7 @@ lvgl:
             text: "Currency"
             text_font: font_ui
             text_color: 0x8a8780
-            x: 0
+            x: 8
             y: 176
         - textarea:
             id: ta_currency
@@ -2613,11 +2768,11 @@ lvgl:
             text: "Display rotation"
             text_font: font_ui
             text_color: 0x8a8780
-            x: 216
+            x: 208
             y: 176
         - dropdown:
             id: dd_rotation
-            x: 380
+            x: 372
             y: 166
             width: 100
             height: 52
@@ -2661,13 +2816,13 @@ lvgl:
             text: "Backlight"
             text_font: font_ui
             text_color: 0x8a8780
-            x: 0
+            x: 8
             y: 218
         - slider:
             id: backlight_slider
-            x: 0
+            x: 8
             y: 250
-            width: 480
+            width: 464
             height: 28
             min_value: 1
             max_value: 100
@@ -2682,7 +2837,7 @@ lvgl:
             text: "Relay1"
             text_font: font_ui
             text_color: 0x8a8780
-            x: 0
+            x: 8
             y: 294
         - switch:
             id: sw_relay1
@@ -2714,7 +2869,7 @@ lvgl:
             text: "Relay2"
             text_font: font_ui
             text_color: 0x8a8780
-            x: 0
+            x: 8
             y: 344
         - switch:
             id: sw_relay2
@@ -2746,7 +2901,7 @@ lvgl:
             text: "Relay3"
             text_font: font_ui
             text_color: 0x8a8780
-            x: 0
+            x: 8
             y: 394
         - switch:
             id: sw_relay3
@@ -2777,7 +2932,7 @@ lvgl:
         - button:
             id: restart_button
             x: 366
-            y: 420
+            y: 416
             width: 110
             height: 52
             radius: 10
@@ -2797,6 +2952,7 @@ lvgl:
                   text_color: 0xf0f0f0
             on_click:
               then:
+                - light.turn_off: display_backlight
                 - script.execute: restart_device
         - keyboard:
             id: setup_kb
@@ -2906,7 +3062,7 @@ text:
       - lvgl.textarea.update:
           id: ta_tickers
           text: !lambda 'return x;'
-      - script.execute: get_tickers_shares
+      - script.execute: get_tickers
       - script.execute: fetch_all
 
   - platform: template
@@ -2925,7 +3081,7 @@ text:
       - lvgl.textarea.update:
           id: ta_shares
           text: !lambda 'return x;'
-      - script.execute: get_tickers_shares
+      - script.execute: get_shares
       - script.execute: fetch_all
 
 sensor:
@@ -3087,6 +3243,11 @@ sensor:
 
 
 text_sensor:
+  - platform: template
+    name: "Version"
+    lambda: |-
+      return "${app_version}";
+      
   - platform: wifi_info
     ip_address:
       name: "WiFi IP"
@@ -3187,7 +3348,7 @@ switch:
     on_turn_on:
       - if:
           condition:
-            lambda: 'return !id(g_relay1);'
+            lambda: 'return !id(g_relay2);'
           then:
             - lambda: 'id(g_relay2) = true;'
             - lvgl.widget.update:
@@ -3198,7 +3359,7 @@ switch:
     on_turn_off:
       - if:
           condition:
-            lambda: 'return !id(g_relay1);'
+            lambda: 'return !id(g_relay2);'
           then:
             - lambda: 'id(g_relay2) = true;'
             - lvgl.widget.update:
@@ -3213,7 +3374,7 @@ switch:
     on_turn_on:
       - if:
           condition:
-            lambda: 'return !id(g_relay1);'
+            lambda: 'return !id(g_relay3);'
           then:
             - lambda: 'id(g_relay3) = true;'
             - lvgl.widget.update:
@@ -3224,7 +3385,7 @@ switch:
     on_turn_off:
       - if:
           condition:
-            lambda: 'return !id(g_relay1);'
+            lambda: 'return !id(g_relay3);'
           then:
             - lambda: 'id(g_relay3) = true;'
             - lvgl.widget.update:
