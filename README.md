@@ -27,6 +27,10 @@ It displays stock prices, daily changes, market status and an intraday chart, wi
 
 ## Screenshots
 
+### Start screen
+
+![StoxBox Quote screen](page_splash.png)
+
 ### Quote screen
 
 ![StoxBox Quote screen](page_quote.png)
