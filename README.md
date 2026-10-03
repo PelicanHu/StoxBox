@@ -59,8 +59,8 @@ The Setup screen allows the main device settings to be changed directly from the
 
 ## Hardware
 
-![Hardware](guition_esp32-s3-4848s040.png)
-![Hardware](guition_esp32-s3-4848s040-connector.png)
+![Hardware](guition-esp32-s3-4848s040.png)
+![Hardware](guition-esp32-s3-4848s040-connector.png)
 
 The configuration targets:
 
