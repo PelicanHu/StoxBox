@@ -45,6 +45,10 @@ Swipe left for the next or swipe right for the previous ticker.
 When share quantities are configured, the portfolio value can also be displayed together with the current market data.
 Double tap the screen to turn on/off showing the value.
 
+### Sum of values scrren
+
+![StoxBox Sum screen](page_sum.png)
+
 ### Info screen
 
 ![StoxBox Info screen](page_info.png)
