@@ -4,17 +4,24 @@
 # The ticker symbols and share counts come from the configuration fields (g_tickers_raw, g_shares_raw).
 # Up to 6 tickers. Multiple share counts: "10 4" or "10, 4", corresponding to the order of the tickers.
 #
+# SD card (Guition 4848S040): SPI CLK=GPIO48, MOSI=GPIO47, MISO=GPIO41, CS=GPIO42.
+# Optional SD assets: /sd/LOGO.PNG and /sd/BACK.PNG.
+# HA button "Take screenshot (SD)" writes /sd/SCR_xxxx.BMP.
+#
 # secrets.yaml:
 #   wifi_ssid / wifi_password / api_encryption_key
 
 substitutions:
   device_name: stoxbox
-  poll_seconds: "60s"
-  app_version: "0.50"
+  poll_seconds: "60"
+  app_version: "0.60"
   ha_topic: "stoxbox/quote"
   
 esphome:
   name: ${device_name}
+  build_flags:
+    - "-DLV_USE_SNAPSHOT=1"  
+    - "-DLV_USE_LODEPNG=1"        
   includes:
     - <esp_heap_caps.h>
     - <esp_system.h>
@@ -26,8 +33,9 @@ esphome:
     - <esp_app_format.h>
     - <esp_psram.h>
     - <esp_wifi.h>
+    - "stoxbox_sd.h"
   friendly_name: 'StoxBox'
-  min_version: "2026.7.0"
+  min_version: "2026.9.0"
   on_boot:
     - priority: -100
       then:
@@ -66,6 +74,14 @@ esphome:
             id: sw_relay3
             state:
               checked: !lambda 'return id(g_relay3);'
+        - lvgl.switch.update: 
+            id: sw_showval
+            state:
+              checked: !lambda 'return id(g_show_value);'
+        - lvgl.switch.update: 
+            id: sw_sumusd
+            state:
+              checked: !lambda 'return id(g_sum_in_usd);'
         - lvgl.dropdown.update: 
             id: dd_rotation
             selected_index: !lambda |-
@@ -81,6 +97,8 @@ esphome:
             id(ha_relay1).publish_state(id(g_relay1));
             id(ha_relay2).publish_state(id(g_relay2));
             id(ha_relay3).publish_state(id(g_relay3));
+            id(ha_showval).publish_state(id(g_show_value));
+            id(ha_sumusd).publish_state(id(g_sum_in_usd));
             const char *rotation_options[4] = {"0°", "90°", "180°", "270°"};
             int rotation_idx = 0;
             if (id(g_rotation) == 90) rotation_idx = 1;
@@ -118,14 +136,26 @@ esphome:
             // MAC
             std::string mac = id(wifi_mac_info).state;
             snprintf(b, sizeof(b), "MAC: %s", mac.empty() ? "--" : mac.c_str());
-            lv_label_set_text(id(info_mac), b);          
+            lv_label_set_text(id(info_mac), b);
+
+        - script.execute: apply_saved_switches
+
+        - lambda: |-
+            if (!stoxbox_sd_mount()) {
+              ESP_LOGW("stoxbox_sd", "SD card not mounted; using firmware images");
+            } else {
+              stoxbox_sd_apply_assets(id(splash_logo_img), id(back_img_quote), id(back_img_setup), id(back_img_info));
+            }
 
         # All boot-time LVGL state is now prepared. The first actual render
         # therefore uses the persisted orientation.
         - lvgl.resume:
+        - lvgl.slider.update:
+            id: backlight_slider
+            value: !lambda 'return id(g_backlight);'
         - light.turn_on:
             id: display_backlight
-            brightness: 0.5
+            brightness: !lambda 'return id(g_backlight) / 100.0f;'
             transition_length: 0s
         - lvgl.page.show:
             id: page_splash
@@ -154,10 +184,22 @@ esp32:
   flash_size: 16MB
   framework:
     type: esp-idf
+    advanced:
+      include_builtin_idf_components:
+        - esp_driver_spi
+        - esp_driver_sdspi
+        - esp_driver_sdmmc
+        - fatfs
+        - vfs
     sdkconfig_options:
       CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
       CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
       CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_LV_USE_FS_FATFS: "1"
+      CONFIG_LV_FS_FATFS_LETTER: "S"
+      CONFIG_LV_FS_FATFS_PATH: "/sd/"
+      CONFIG_LV_USE_LODEPNG: "1"
+      CONFIG_LV_USE_SNAPSHOT: "1"
 
 psram:
   mode: octal
@@ -167,17 +209,20 @@ logger:
 
 preferences:
   id: stoxbox_preferences
+  flash_write_interval: 5s
 
 api:
   encryption:
     key: !secret stoxbox__encryption_key
+  on_client_connected:
+    - script.execute: publish_config_to_ha
+
 ota:
   - platform: esphome
     on_begin:
       - lvgl.page.show: 
           id: page_splash
       - lambda: |-
-          id(ota_progress) = 0;
           lv_obj_clear_flag(id(ota_box), LV_OBJ_FLAG_HIDDEN);
           lv_timer_handler();
     on_end:
@@ -185,9 +230,7 @@ ota:
         - light.turn_off: display_backlight      
     on_progress:
       then:
-        - switch.toggle: ha_relay1
         - lambda: |-
-            id(ota_progress) = x;  
             lv_bar_set_value(id(ota_progress_bar),(int)x+5,LV_ANIM_OFF);
             if (x >= 94.0f) {
               id(backlight_output).set_level(0.0f);
@@ -222,6 +265,7 @@ http_request:
 
 spi:
   - id: lcd_spi
+    interface: spi3
     clk_pin: GPIO48
     mosi_pin: GPIO47
 
@@ -245,7 +289,7 @@ light:
     output: backlight_output
     name: Backlight
     id: display_backlight
-    restore_mode: RESTORE_DEFAULT_ON
+    restore_mode: ALWAYS_ON
     default_transition_length: 1s
     on_state:
       then:
@@ -299,6 +343,8 @@ touchscreen:
     display: tft_display
     i2c_id: touchscreen_bus
 
+# Firmware defaults. If /sd/logo.png or /sd/back.png exists, the SD copy is
+# selected at runtime after the LVGL objects are created.
 image:
   - platform: file
     file: "logo.png"
@@ -312,7 +358,7 @@ image:
     resize: 480x480
 
 font:
-  - file: "gfonts://Google Sans"
+  - file: "gfonts://Google Sans@700"
     id: font_price
     size: 106
     glyphs: "0123456789., -OTA"
@@ -323,7 +369,7 @@ font:
   - file: "gfonts://Google Sans"
     id: font_value
     size: 52
-    glyphs: "0123456789.,-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz$€£¥ "
+    glyphs: "0123456789.,-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz$€£¥ ֏ƒ৳č₾₪₹៛₩₸₭ден₮₱ł₽฿₺₴₫"
   - file: "gfonts://Google Sans"
     id: font_qty
     size: 26
@@ -332,6 +378,10 @@ font:
     id: font_ui
     size: 22
     glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~°"
+  - file: "gfonts://Google Sans@700"
+    id: font_ticker
+    size: 22
+    glyphs: ".ABCDEFGHIJKLMNOPQRSTUVWXYZ"
   - file: "gfonts://Google Sans"
     id: font_setup
     size: 24
@@ -340,6 +390,10 @@ font:
     id: font_info
     size: 25
     glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~°"
+  - file: "gfonts://Google Sans"
+    id: font_small
+    size: 14
+    glyphs: "htper"
 
 globals:
   - id: g_tickers_raw
@@ -355,6 +409,18 @@ globals:
     restore_value: no
     initial_value: "0"
   - id: g_show_value
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: g_showval_change
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_sum_in_usd
+    type: bool
+    restore_value: yes
+    initial_value: "true"
+  - id: g_sumusd_change
     type: bool
     restore_value: no
     initial_value: "false"
@@ -400,13 +466,38 @@ globals:
     initial_value: "false"
   - id: g_relay1
     type: bool
-    restore_value: no
+    restore_value: yes
     initial_value: "false"
   - id: g_relay2
     type: bool
-    restore_value: no
+    restore_value: yes
     initial_value: "false"
   - id: g_relay3
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: g_relay1_change
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_relay2_change
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_relay3_change
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # Scratch flags for setup commit. Do not reuse the relay guards.
+  - id: g_tickers_changed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_shares_changed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: g_currency_changed
     type: bool
     restore_value: no
     initial_value: "false"
@@ -415,6 +506,11 @@ globals:
     type: int
     restore_value: yes
     initial_value: "0"
+  # Backlight percent, 20-100. The boot path must not force 50%.
+  - id: g_backlight
+    type: int
+    restore_value: yes
+    initial_value: "50"
   # Guard against HA <-> LVGL feedback loops while applying rotation.
   - id: g_rotation_busy
     type: bool
@@ -704,20 +800,178 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
-  - id: ota_progress
-    type: float
+  - id: g_shcnt
+    type: uint32_t
     restore_value: no
     initial_value: "0"
-    
+
 script:
   - id: restart_device
     mode: restart
     then:
       - lambda: |-
           id(backlight_output).set_level(0.0f);
-      - delay: 500ms  
+      # Globals only hit flash on the preference interval; flush before restart.
+      - component.update: stoxbox_preferences
+      - delay: 500ms
       - lambda: |-
           esp_restart();
+
+  # Write restored globals immediately. component.update alone can lose a
+  # value changed in the same automation cycle.
+  - id: persist_settings
+    mode: restart
+    then:
+      - lambda: |-
+          global_preferences->sync();
+      - component.update: stoxbox_preferences
+
+  # Device is the source of truth for these fields. Republish after HA connects
+  # so a stale HA restore cannot win.
+  - id: publish_config_to_ha
+    mode: restart
+    then:
+      - lambda: |-
+          id(ha_ticker_list).publish_state(id(g_tickers_raw));
+          id(ha_shares_list).publish_state(id(g_shares_raw));
+          id(ha_currency).publish_state(id(g_currency_code));
+          id(ha_showval).publish_state(id(g_show_value));
+          id(ha_sumusd).publish_state(id(g_sum_in_usd));
+          const char *rotation_options[4] = {"0°", "90°", "180°", "270°"};
+          int rotation_idx = 0;
+          if (id(g_rotation) == 90) rotation_idx = 1;
+          else if (id(g_rotation) == 180) rotation_idx = 2;
+          else if (id(g_rotation) == 270) rotation_idx = 3;
+          id(g_rotation_busy) = true;
+          id(ha_rotation).publish_state(rotation_options[rotation_idx]);
+          id(g_rotation_busy) = false;
+          id(g_relay1_change) = true;
+          id(g_relay2_change) = true;
+          id(g_relay3_change) = true;
+          id(g_showval_change) = true;
+          id(g_sumusd_change) = true;
+      - if:
+          condition:
+            lambda: 'return id(g_show_value);'
+          then:
+            - switch.turn_on: ha_showval
+          else:
+            - switch.turn_off: ha_showval
+      - if:
+          condition:
+            lambda: 'return id(g_sum_in_usd);'
+          then:
+            - switch.turn_on: ha_sumusd
+          else:
+            - switch.turn_off: ha_sumusd
+      - lambda: |-
+          id(g_relay1_change) = false;
+          id(g_relay2_change) = false;
+          id(g_relay3_change) = false;
+          id(g_showval_change) = false;
+          id(g_sumusd_change) = false;
+
+  # Read the setup fields, publish them to HA, and flush flash.
+  - id: commit_setup_fields
+    mode: restart
+    then:
+      - lambda: |-
+          const char *tsym = lv_textarea_get_text(id(ta_tickers));
+          const char *tsh = lv_textarea_get_text(id(ta_shares));
+          const char *tcur = lv_textarea_get_text(id(ta_currency));
+          std::string tickers = tsym ? std::string(tsym) : std::string("");
+          std::string shares = tsh ? std::string(tsh) : std::string("");
+          std::string cur = tcur && tcur[0] ? std::string(tcur) : std::string("USD");
+          for (size_t i = 0; i < cur.size(); i++) {
+            if (cur[i] >= 'a' && cur[i] <= 'z') cur[i] = (char)(cur[i] - 'a' + 'A');
+          }
+          bool tickers_changed = id(g_tickers_raw) != tickers;
+          bool shares_changed = id(g_shares_raw) != shares;
+          bool cur_changed = id(g_currency_code) != cur;
+          id(g_tickers_raw) = tickers;
+          id(g_shares_raw) = shares;
+          id(g_currency_code) = cur;
+          id(ha_ticker_list).publish_state(tickers);
+          id(ha_shares_list).publish_state(shares);
+          id(ha_currency).publish_state(cur);
+          global_preferences->sync();
+          id(g_tickers_changed) = tickers_changed;
+          id(g_shares_changed) = shares_changed;
+          id(g_currency_changed) = cur_changed;
+      - if:
+          condition:
+            lambda: 'return id(g_tickers_changed);'
+          then:
+            - script.execute: get_tickers
+            - script.execute: fetch_all
+      - if:
+          condition:
+            lambda: 'return id(g_shares_changed);'
+          then:
+            - script.execute: get_shares
+      - if:
+          condition:
+            lambda: 'return id(g_currency_changed);'
+          then:
+            - script.execute: fetch_currency
+      - lambda: |-
+          id(g_tickers_changed) = false;
+          id(g_shares_changed) = false;
+          id(g_currency_changed) = false;
+      - script.execute: paint_active
+
+  # Drive HA/GPIO from restored globals. Switches use restore_mode DISABLED so
+  # their setup cannot clobber the globals with the default off state.
+  - id: apply_saved_switches
+    mode: restart
+    then:
+      - lambda: |-
+          id(g_relay1_change) = true;
+          id(g_relay2_change) = true;
+          id(g_relay3_change) = true;
+          id(g_showval_change) = true;
+          id(g_sumusd_change) = true;
+      - if:
+          condition:
+            lambda: 'return id(g_relay1);'
+          then:
+            - switch.turn_on: ha_relay1
+          else:
+            - switch.turn_off: ha_relay1
+      - if:
+          condition:
+            lambda: 'return id(g_relay2);'
+          then:
+            - switch.turn_on: ha_relay2
+          else:
+            - switch.turn_off: ha_relay2
+      - if:
+          condition:
+            lambda: 'return id(g_relay3);'
+          then:
+            - switch.turn_on: ha_relay3
+          else:
+            - switch.turn_off: ha_relay3
+      - if:
+          condition:
+            lambda: 'return id(g_show_value);'
+          then:
+            - switch.turn_on: ha_showval
+          else:
+            - switch.turn_off: ha_showval
+      - if:
+          condition:
+            lambda: 'return id(g_sum_in_usd);'
+          then:
+            - switch.turn_on: ha_sumusd
+          else:
+            - switch.turn_off: ha_sumusd
+      - lambda: |-
+          id(g_relay1_change) = false;
+          id(g_relay2_change) = false;
+          id(g_relay3_change) = false;
+          id(g_showval_change) = false;
+          id(g_sumusd_change) = false;
 
   # Apply persisted rotation to the display + LVGL (and keep the setup dropdown in sync).
   - id: apply_rotation
@@ -751,6 +1005,48 @@ script:
           const char *opts[4] = {"0°", "90°", "180°", "270°"};
           id(ha_rotation).publish_state(opts[idx]);
           id(g_rotation_busy) = false;
+
+  # Save the current LVGL screen as /sd/SCR_xxxx.BMP.
+  - id: save_screenshot_sd
+    mode: restart
+    then:
+      - lambda: |-
+          if (!stoxbox_sd_screenshot(id(g_rotation))) {
+            ESP_LOGW("stoxbox_sd", "Could not save screenshot to SD card");
+          } else {
+            ESP_LOGI("stoxbox_sd", "Saved screenshot to SD card");
+            uint32_t sd_files = 0;
+            uint64_t sd_free = 0;
+            uint64_t sd_total = 0;
+  
+            if (stoxbox_sd_get_info(sd_files, sd_free, sd_total)) {
+              char sd_text[64];
+  
+              if ((sd_total / (1024ULL * 1024ULL)) > 10000) {
+                  snprintf(
+                      sd_text,
+                      sizeof(sd_text),
+                      "%lu files, %.1f/%.1f GB",
+                      (unsigned long) sd_files,
+                      (double) sd_free / (1024.0 * 1024.0 * 1024.0),
+                      (double) sd_total / (1024.0 * 1024.0 * 1024.0)
+                  );
+              } else {
+                snprintf(
+                    sd_text,
+                    sizeof(sd_text),
+                    "%lu files, %llu/%llu MB",
+                    (unsigned long) sd_files,
+                    (unsigned long long) (sd_free / (1024ULL * 1024ULL)),
+                    (unsigned long long) (sd_total / (1024ULL * 1024ULL))
+                );
+              }
+  
+              lv_label_set_text(id(info_sd), sd_text);
+            } else {
+              lv_label_set_text(id(info_sd), "No card");
+            }            
+          }
 
   - id: get_tickers_shares
     then:
@@ -845,70 +1141,171 @@ script:
     then:
       - lambda: |-
             int n = id(g_count);
+            if(n == 0) return;
             int i = id(g_index);
-            if (n < 1) i = 0;
-            else if (i < 0 || i >= n) i = 0;
+            int shcnt = 0;
+            lv_obj_t *tickers[6] = { id(ticker_0), id(ticker_1), id(ticker_2), id(ticker_3), id(ticker_4), id(ticker_5) };
+            const char *syms[6] = { id(g_sym_0).c_str(), id(g_sym_1).c_str(), id(g_sym_2).c_str(), 
+                                    id(g_sym_3).c_str(), id(g_sym_4).c_str(), id(g_sym_5).c_str() };
+            float chgs[6] = { id(g_chg_0), id(g_chg_1), id(g_chg_2), id(g_chg_3), id(g_chg_4), id(g_chg_5) };
+            float pcts[6] = { id(g_pct_0), id(g_pct_1), id(g_pct_2), id(g_pct_3), id(g_pct_4), id(g_pct_5) };
+            float prcs[6] = { id(g_price_0), id(g_price_1), id(g_price_2), id(g_price_3), id(g_price_4), id(g_price_5) };
+            float shs[6] = { id(g_sh_0), id(g_sh_1), id(g_sh_2), id(g_sh_3), id(g_sh_4), id(g_sh_5) };
+            int tss[6] = { id(g_ts_0), id(g_ts_1), id(g_ts_2), id(g_ts_3), id(g_ts_4), id(g_ts_5) };
+            float los[6] = { id(g_lo_0), id(g_lo_1), id(g_lo_2), id(g_lo_3), id(g_lo_4), id(g_lo_5) };
+            float his[6] = { id(g_hi_0), id(g_hi_1), id(g_hi_2), id(g_hi_3), id(g_hi_4), id(g_hi_5) };
+            bool loads[6] = { id(g_loaded_0), id(g_loaded_1), id(g_loaded_2), id(g_loaded_3), id(g_loaded_4), id(g_loaded_5) };
+            for (int j=0; j<6; j++) if(shs[j]>0) shcnt++; 
+            id(g_shcnt)=shcnt;
+            bool showval = id(g_show_value);
+            bool sumusd = id(g_sum_in_usd);
+            bool sum = shcnt>1 && showval;
+            float rate = id(g_fx_rate);
+            if (sum) {
+              if (n < 1) i = 0; else if (i < 0 || i > n) i = 0;
+              lv_color_t col = i==n ? lv_color_hex(0xffff00) : lv_color_hex(0x777700);
+              lv_obj_set_style_text_color(id(ticker_sum), col, LV_PART_MAIN);
+              lv_obj_clear_flag(id(ticker_sum), LV_OBJ_FLAG_HIDDEN); 
+            } else {
+              if (n < 1) i = 0; else if (i < 0 || i >= n) i = 0;
+              lv_obj_add_flag(id(ticker_sum), LV_OBJ_FLAG_HIDDEN); 
+            }
+            if (i == n) {
+              lv_obj_add_flag(id(status_box), LV_OBJ_FLAG_HIDDEN); 
+              lv_obj_clear_flag(id(lbl_sumticker), LV_OBJ_FLAG_HIDDEN); 
+              lv_obj_clear_flag(id(lbl_sumvalue), LV_OBJ_FLAG_HIDDEN);
+              char buf[96];
+              buf[0] = '\0';
+              for (int j = 0; j < 6; j++) {
+                int len = strlen(buf);
+                if(syms[j][0] != '\0' && shs[j] > 0 && prcs[j] > 0) {
+                  char txt[8];
+                  snprintf(txt, sizeof(txt), "%s\n", syms[j]);
+                  snprintf(buf + len, sizeof(buf) - len, "%s", txt);
+                }
+              }   
+              int len = strlen(buf);
+              const char *cs = id(g_currency_symbol).empty() ? id(g_currency_code).c_str() : id(g_currency_symbol).c_str();
+              if(!sumusd && rate>0.0) {
+                snprintf(buf + len, sizeof(buf) - len, "Total %s",cs);
+              } else {
+                snprintf(buf + len, sizeof(buf) - len, "Total");
+              }  
+              //snprintf(buf, sizeof(buf), "%s\n%s\n%s\n%s\n%s\n%s\nTotal", syms[0], syms[1], syms[2], syms[3], syms[4], syms[5]);
+              lv_label_set_text(id(lbl_sumticker), buf);
+              buf[0] = '\0'; 
+              float total = 0.0;
+              if(!sumusd && rate>0.0) {
+                for (int j = 0; j < 6; j++) {
+                  int len = strlen(buf);
+                  if(syms[j][0] != '\0' && shs[j] > 0 && prcs[j] > 0) {
+                    float value = prcs[j] * shs[j] * rate;
+                    total += value;
+                    char val[12];
+                    if (value < 1000.0f) {
+                      snprintf(val, sizeof(val), "%.2f\n", value);
+                    } else if (value < 100000.0f) {
+                      snprintf(val, sizeof(val), "%.0f\n", value);
+                    } else if (value < 1000000.0f) {
+                      snprintf(val, sizeof(val), "%.2fk\n", value / 1000.0f);
+                    } else if (value < 10000000.0f) {
+                      snprintf(val, sizeof(val), "%.2fM\n", value / 1000000.0f);
+                    } else {
+                      snprintf(val, sizeof(val), "%.1fM\n", value / 1000000.0f);
+                    }
+                    snprintf(buf + len, sizeof(buf) - len, "%s", val);
+                  } 
+                }
+                char val[12];
+                if (total < 1000.0f) {
+                  snprintf(val, sizeof(val), "%.2f\n", total);
+                } else if (total < 100000.0f) {
+                  snprintf(val, sizeof(val), "%.0f\n", total);
+                } else if (total < 1000000.0f) {
+                  snprintf(val, sizeof(val), "%.2fk\n", total / 1000.0f);
+                } else if (total < 10000000.0f) {
+                  snprintf(val, sizeof(val), "%.2fM\n", total / 1000000.0f);
+                } else if (total < 100000000.0f) {
+                  snprintf(val, sizeof(val), "%.1fM\n", total / 1000000.0f);
+                } else {
+                  snprintf(val, sizeof(val), "%.0fM\n", total / 1000000.0f);
+                }
+                int len = strlen(buf);
+                snprintf(buf + len, sizeof(buf) - len, "%s", val);
+              } else {
+                for (int j = 0; j < 6; j++) {
+                  int len = strlen(buf);
+                  if(syms[j][0] != '\0' && shs[j] > 0 && prcs[j] > 0) {
+                    float usd_value = prcs[j] * shs[j];
+                    total += usd_value;
+                    char val[12];
+                    if (usd_value < 1000.0f) {
+                      snprintf(val, sizeof(val), "$%.2f\n", usd_value);
+                    } else if (usd_value < 100000.0f) {
+                      snprintf(val, sizeof(val), "$%.0f\n", usd_value);
+                    } else if (usd_value < 1000000.0f) {
+                      snprintf(val, sizeof(val), "$%.2fk\n", usd_value / 1000.0f);
+                    } else if (usd_value < 10000000.0f) {
+                      snprintf(val, sizeof(val), "$%.2fM\n", usd_value / 1000000.0f);
+                    } else if (usd_value < 100000000.0f) {
+                      snprintf(val, sizeof(val), "$%.1fM\n", usd_value / 1000000.0f);
+                    } else {
+                      snprintf(val, sizeof(val), "$%.0fM\n", usd_value / 1000000.0f);
+                    }
+                    snprintf(buf + len, sizeof(buf) - len, "%s", val);
+                  } 
+                }
+                char val[12];
+                if (total < 1000.0f) {
+                  snprintf(val, sizeof(val), "$%.2f\n", total);
+                } else if (total < 100000.0f) {
+                  snprintf(val, sizeof(val), "$%.0f\n", total);
+                } else if (total < 1000000.0f) {
+                  snprintf(val, sizeof(val), "$%.2fk\n", total / 1000.0f);
+                } else {
+                  snprintf(val, sizeof(val), "$%.2fM\n", total / 1000000.0f);
+                }
+                int len = strlen(buf);
+                snprintf(buf + len, sizeof(buf) - len, "%s", val);
+              }  
+
+              lv_label_set_text(id(lbl_sumvalue), buf);
+              
+            } else {
+              lv_obj_add_flag(id(lbl_sumticker), LV_OBJ_FLAG_HIDDEN); 
+              lv_obj_add_flag(id(lbl_sumvalue), LV_OBJ_FLAG_HIDDEN); 
+              lv_obj_clear_flag(id(status_box), LV_OBJ_FLAG_HIDDEN); 
+            }
             id(g_index) = i;
-            std::string sym = id(g_sym_0);
-            if (i == 1) sym = id(g_sym_1);
-            if (i == 2) sym = id(g_sym_2);
-            if (i == 3) sym = id(g_sym_3);
-            if (i == 4) sym = id(g_sym_4);
-            if (i == 5) sym = id(g_sym_5);
-            std::string name = id(g_name_0);
+            std::string sym = ""; 
+            float price = 0.0, chg = 0.0, sh = 0.0, pct = 0.0, hi = 0.0, lo = 0.0;
+            int ts = 0;
+            for (int j=0; j<6; j++) {
+              if (i == j) {
+                sym=syms[j]; 
+                price=prcs[j]; 
+                chg=chgs[j]; 
+                pct=pcts[j]; 
+                sh=shs[j]; 
+                ts=tss[j]; 
+                lo=los[j]; 
+                hi=his[j]; 
+              }  
+            }  
+            std::string name = "";
+            if (i == 0) name = id(g_name_0);
             if (i == 1) name = id(g_name_1);
             if (i == 2) name = id(g_name_2);
             if (i == 3) name = id(g_name_3);
             if (i == 4) name = id(g_name_4);
             if (i == 5) name = id(g_name_5);
-            std::string spark = id(g_spark_0);
+            std::string spark = "";
+            if (i == 0) spark = id(g_spark_0);
             if (i == 1) spark = id(g_spark_1);
             if (i == 2) spark = id(g_spark_2);
             if (i == 3) spark = id(g_spark_3);
             if (i == 4) spark = id(g_spark_4);
             if (i == 5) spark = id(g_spark_5);
-            float price = id(g_price_0);
-            if (i == 1) price = id(g_price_1);
-            if (i == 2) price = id(g_price_2);
-            if (i == 3) price = id(g_price_3);
-            if (i == 4) price = id(g_price_4);
-            if (i == 5) price = id(g_price_5);
-            float chg = id(g_chg_0);
-            if (i == 1) chg = id(g_chg_1);
-            if (i == 2) chg = id(g_chg_2);
-            if (i == 3) chg = id(g_chg_3);
-            if (i == 4) chg = id(g_chg_4);
-            if (i == 5) chg = id(g_chg_5);
-            float pct = id(g_pct_0);
-            if (i == 1) pct = id(g_pct_1);
-            if (i == 2) pct = id(g_pct_2);
-            if (i == 3) pct = id(g_pct_3);
-            if (i == 4) pct = id(g_pct_4);
-            if (i == 5) pct = id(g_pct_5);
-            float hi = id(g_hi_0);
-            if (i == 1) hi = id(g_hi_1);
-            if (i == 2) hi = id(g_hi_2);
-            if (i == 3) hi = id(g_hi_3);
-            if (i == 4) hi = id(g_hi_4);
-            if (i == 5) hi = id(g_hi_5);
-            float lo = id(g_lo_0);
-            if (i == 1) lo = id(g_lo_1);
-            if (i == 2) lo = id(g_lo_2);
-            if (i == 3) lo = id(g_lo_3);
-            if (i == 4) lo = id(g_lo_4);
-            if (i == 5) lo = id(g_lo_5);
-            float sh = id(g_sh_0);
-            if (i == 1) sh = id(g_sh_1);
-            if (i == 2) sh = id(g_sh_2);
-            if (i == 3) sh = id(g_sh_3);
-            if (i == 4) sh = id(g_sh_4);
-            if (i == 5) sh = id(g_sh_5);
-            int ts = id(g_ts_0);
-            if (i == 1) ts = id(g_ts_1);
-            if (i == 2) ts = id(g_ts_2);
-            if (i == 3) ts = id(g_ts_3);
-            if (i == 4) ts = id(g_ts_4);
-            if (i == 5) ts = id(g_ts_5);
             char buf[72];
             if (n < 1 || sym.empty()) {
               lv_label_set_text(id(lbl_name), "");
@@ -987,48 +1384,39 @@ script:
             if (open) {
               lv_label_set_text(id(lbl_status), "OPEN");
               lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x3DCF8E), LV_PART_MAIN);
-              //lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x3DCF8E), LV_PART_MAIN);
-              lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x10261C), LV_PART_MAIN);
-              lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x10261C), LV_PART_MAIN);
-              lv_obj_set_x(id(status_box), 390); 
-              lv_obj_set_width(id(status_box), 90);
+              lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x3DFF8E), LV_PART_MAIN);
+              lv_obj_set_x(id(status_box), 390); lv_obj_set_width(id(status_box), 90);
+              lv_obj_set_x(id(http_box), 390-64);               
             } else {
               bool pre=id(g_premarket);
               bool after=id(g_aftermarket);
               if (pre) { 
                 lv_label_set_text(id(lbl_status), "PRE-MARKET");
-                lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x6FC7FF), LV_PART_MAIN);
-                //lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x2D6F9A), LV_PART_MAIN);
-                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x0D1C26), LV_PART_MAIN);
-                lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x0D1C26), LV_PART_MAIN);
-                lv_obj_set_x(id(status_box), 320); 
-                lv_obj_set_width(id(status_box), 160);
+                lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xeeee4c), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0xeeee4c), LV_PART_MAIN);
+                lv_obj_set_x(id(status_box), 320); lv_obj_set_width(id(status_box), 160);
+                lv_obj_set_x(id(http_box), 320-64); 
               } else if (after) {
                 lv_label_set_text(id(lbl_status), "AFTER HOURS");
-                lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xC58CFF), LV_PART_MAIN);
-                //lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x6E4A91), LV_PART_MAIN);
-                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x1B1224), LV_PART_MAIN);
-                lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x1B1224), LV_PART_MAIN);
-                lv_obj_set_x(id(status_box), 320); 
-                lv_obj_set_width(id(status_box), 160);
+                lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x658CFF), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x658CFF), LV_PART_MAIN);
+                lv_obj_set_x(id(status_box), 320); lv_obj_set_width(id(status_box), 160);
+                lv_obj_set_x(id(http_box), 320-64); 
               } else {
                 lv_label_set_text(id(lbl_status), "CLOSED");
                 lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x8A8780), LV_PART_MAIN);
-                //lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x3A3A34), LV_PART_MAIN);
-                lv_obj_set_style_border_color(id(status_box), lv_color_hex(0x141412), LV_PART_MAIN);
-                lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x141412), LV_PART_MAIN);
-                lv_obj_set_x(id(status_box), 380); 
-                lv_obj_set_width(id(status_box), 100);
+                lv_obj_set_style_bg_color(id(status_box), lv_color_hex(0x8A8780), LV_PART_MAIN);
+                lv_obj_set_x(id(status_box), 380); lv_obj_set_width(id(status_box), 100);
+                lv_obj_set_x(id(http_box), 380-64);                 
               }
             }
-            lv_obj_t *tickers[6] = { id(ticker_0), id(ticker_1), id(ticker_2), id(ticker_3), id(ticker_4), id(ticker_5) };
-            const char *syms[6] = { id(g_sym_0).c_str(), id(g_sym_1).c_str(), id(g_sym_2).c_str(), 
-                                    id(g_sym_3).c_str(), id(g_sym_4).c_str(), id(g_sym_5).c_str() };
-            float chgs[6] = { id(g_chg_0), id(g_chg_1), id(g_chg_2), id(g_chg_3), id(g_chg_4), id(g_chg_5) };
-            float prcs[6] = { id(g_price_0), id(g_price_1), id(g_price_2), id(g_price_3), id(g_price_4), id(g_price_5) };
-            bool loads[6] = { id(g_loaded_0), id(g_loaded_1), id(g_loaded_2), id(g_loaded_3), id(g_loaded_4), id(g_loaded_5) };
-            const int cell_w = 80;
-            const int start_x = (480 - n * cell_w) / 2;
+
+            int extr=0; if (sum) extr = 1;
+
+            int cell_w = 480 / (n + extr); 
+            if(cell_w>120) cell_w=120;
+            
+            const int start_x = (480 -  (n + extr) * cell_w) / 2;
             for (int d = 0; d < 6; d++) {
               if (n < 1 || d >= n || syms[d][0] == '\0') {
                 lv_obj_add_flag(tickers[d], LV_OBJ_FLAG_HIDDEN);
@@ -1053,6 +1441,8 @@ script:
                 lv_obj_set_style_text_color(tickers[d], d == i ? bright : dim, LV_PART_MAIN);
               }
             }
+            lv_obj_set_width(id(ticker_sum), cell_w);
+            lv_obj_set_pos(id(ticker_sum), start_x + n * cell_w, 453);
             const int width = 480;
             int height = 196;
             if (id(g_show_value) && sh > 0) height = 108;
@@ -1061,8 +1451,9 @@ script:
             // day_seconds = local seconds from 00:00.
             // 5-minute Yahoo data: pre=66, regular=78, regular+after=126.
             const int MAX_POINTS = 128;
-            int day_seconds[MAX_POINTS];
-            float vals[MAX_POINTS];
+            // Static: these arrays must not sit on the script lambda stack.
+            static int day_seconds[MAX_POINTS];
+            static float vals[MAX_POINTS];
             int vn = 0;
             size_t sp = 0;
 
@@ -1245,7 +1636,6 @@ script:
               // --------------------------------------------------
 
               if (after) {
-
                 float separator_ratio =
                   (float)((16 * 60) - (9 * 60 + 30)) /
                   (float)((20 * 60) - (9 * 60 + 30));
@@ -1279,9 +1669,7 @@ script:
                 lv_obj_invalidate(
                   id(session_separator).obj
                 );
-
               } else {
-
                 lv_obj_add_flag(
                   id(session_separator).obj,
                   LV_OBJ_FLAG_HIDDEN
@@ -1425,7 +1813,7 @@ script:
               else if (i == 4) last = id(g_fetch_ms_4);
               else if (i == 5) last = id(g_fetch_ms_5);
       
-              if (last != 0 && (uint32_t)(now - last) < 60000UL) {
+              if (last != 0 && (uint32_t)(now - last) < ${poll_seconds}000UL) {
                 ESP_LOGD(
                   "fetch_one",
                   "skip %s: %lu ms since last fetch",
@@ -1434,7 +1822,9 @@ script:
                 );
                 return false;
               }
-      
+              lv_label_set_text(id(lbl_http), "http");
+              lv_obj_clear_flag(id(http_box), LV_OBJ_FLAG_HIDDEN);
+              lv_timer_handler();
               return true;
 
           then:
@@ -1682,15 +2072,20 @@ script:
                               else if (i == 3) id(g_fetch_ms_3) = now;
                               else if (i == 4) id(g_fetch_ms_4) = now;
                               else if (i == 5) id(g_fetch_ms_5) = now;
+                              lv_obj_add_flag(id(http_box), LV_OBJ_FLAG_HIDDEN);
                           - script.execute: paint_active
 
                         else:
+                          - lambda: |-
+                              lv_label_set_text(id(lbl_http), "error");
                           - logger.log:
                               format: "Ticker HTTP %d"
                               args: ["response->status_code"]
   - id: fetch_currency
     mode: restart
     then:
+      - lambda: |-
+          lv_obj_clear_flag(id(http_box), LV_OBJ_FLAG_HIDDEN);
       - http_request.get:
           url: !lambda |-
             std::string cc = id(g_currency_code);
@@ -1741,39 +2136,36 @@ script:
                     }
                   }
               - script.execute: paint_active
+        
+      - lambda: |-
+           lv_obj_add_flag(id(http_box), LV_OBJ_FLAG_HIDDEN);
+
   - id: fetch_all
     mode: single
     then:
       - delay: 2000ms
       - script.execute:
-          id: fetch_one
+          id: fetch_from
           slot: 0
-      - script.wait: fetch_one
-      - delay: 1000ms
-      - script.execute:
-          id: fetch_one
-          slot: 1
-      - script.wait: fetch_one
-      - delay: 1000ms
-      - script.execute:
-          id: fetch_one
-          slot: 2
-      - script.wait: fetch_one
-      - delay: 1000ms
-      - script.execute:
-          id: fetch_one
-          slot: 3
-      - script.wait: fetch_one
-      - delay: 1000ms
-      - script.execute:
-          id: fetch_one
-          slot: 4
-      - script.wait: fetch_one
-      - delay: 1000ms
-      - script.execute:
-          id: fetch_one
-          slot: 5
-      - script.wait: fetch_one
+
+  # Fetch only configured slots. Empty tail slots are not queued.
+  - id: fetch_from
+    mode: queued
+    parameters:
+      slot: int
+    then:
+      - if:
+          condition:
+            lambda: 'return slot >= 0 && slot < id(g_count);'
+          then:
+            - script.execute:
+                id: fetch_one
+                slot: !lambda 'return slot;'
+            - script.wait: fetch_one
+            - delay: 1000ms
+            - script.execute:
+                id: fetch_from
+                slot: !lambda 'return slot + 1;'
 
 interval:
   - interval: 1s
@@ -1786,8 +2178,9 @@ interval:
             - script.execute: fetch_current_if_due
       - lambda: |-
           if (lv_scr_act() == id(page_quote).obj) {
-            int ts = id(g_ts_0);
+            int ts = 0;
             int i=id(g_index);
+            if (i == 0) ts = id(g_ts_0);
             if (i == 1) ts = id(g_ts_1);
             if (i == 2) ts = id(g_ts_2);
             if (i == 3) ts = id(g_ts_3);
@@ -1879,7 +2272,38 @@ interval:
           if (isnan(cpu_temp)) snprintf(b, sizeof(b), "--");
           else snprintf(b, sizeof(b), "%.1f °C", cpu_temp);
           lv_label_set_text(id(info_cpu_temp), b);
-    
+
+          // SD card
+          uint32_t sd_files = 0;
+          uint64_t sd_free = 0;
+          uint64_t sd_total = 0;
+
+          if (stoxbox_sd_get_info(sd_files, sd_free, sd_total)) {
+            char sd_text[64];
+            if ((sd_total / (1024ULL * 1024ULL)) > 10000) {
+                snprintf(
+                    sd_text,
+                    sizeof(sd_text),
+                    "%lu files, %.1f/%.1f GB",
+                    (unsigned long) sd_files,
+                    (double) sd_free / (1024.0 * 1024.0 * 1024.0),
+                    (double) sd_total / (1024.0 * 1024.0 * 1024.0)
+                );
+            } else {
+              snprintf(
+                  sd_text,
+                  sizeof(sd_text),
+                  "%lu files, %llu/%llu MB",
+                  (unsigned long) sd_files,
+                  (unsigned long long) (sd_free / (1024ULL * 1024ULL)),
+                  (unsigned long long) (sd_total / (1024ULL * 1024ULL))
+              );
+            }
+            lv_label_set_text(id(info_sd), sd_text);
+          } else {
+            lv_label_set_text(id(info_sd), "No card");
+          }
+
   - interval: 3600s
     then:
       - lambda: |-
@@ -1956,6 +2380,7 @@ lvgl:
       bg_color: 0x000040
       widgets:
         - image:
+            id: splash_logo_img
             src: img_logo
             x: 0
             y: 0
@@ -2030,15 +2455,11 @@ lvgl:
         then:
           - lambda: |-
               lv_indev_wait_release(lv_indev_get_act());
-          - light.turn_off: display_backlight
           - lvgl.page.show:
               id: page_setup
-              animation: OUT_BOTTOM
-              time: 250ms
-          - delay: 250ms  
-          - light.turn_on: display_backlight
       widgets:
         - image:
+            id: back_img_info
             src: img_back
             x: 0
             y: 0
@@ -2077,7 +2498,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 110
-            y: 34
+            y: 33
             width: 360
             height: 32
             long_mode: CLIP
@@ -2087,7 +2508,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 64
+            y: 62
             width: 185
             height: 32
             long_mode: CLIP
@@ -2097,7 +2518,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 64
+            y: 62
             width: 275
             height: 32
             long_mode: CLIP
@@ -2107,7 +2528,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 94
+            y: 91
             width: 185
             height: 32
             long_mode: CLIP
@@ -2117,7 +2538,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 94
+            y: 91
             width: 275
             height: 32
             long_mode: CLIP
@@ -2127,7 +2548,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 124
+            y: 120
             width: 185
             height: 32
             long_mode: CLIP
@@ -2137,7 +2558,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 124
+            y: 120
             width: 275
             height: 32
             long_mode: CLIP
@@ -2147,7 +2568,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 154
+            y: 149
             width: 185
             height: 32
             long_mode: CLIP
@@ -2157,7 +2578,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 154
+            y: 149
             width: 275
             height: 32
             long_mode: CLIP
@@ -2167,7 +2588,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 184
+            y: 178
             width: 185
             height: 32
             long_mode: CLIP
@@ -2177,7 +2598,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 184
+            y: 178
             width: 275
             height: 32
             long_mode: CLIP
@@ -2187,7 +2608,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 214
+            y: 207
             width: 185
             height: 32
             long_mode: CLIP
@@ -2197,8 +2618,28 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 214
+            y: 207
             width: 275
+            height: 32
+            long_mode: CLIP
+            text_align: RIGHT
+        - label:
+            text: "SD card"
+            text_font: font_info
+            text_color: 0x888888
+            x: 10
+            y: 236
+            width: 130
+            height: 32
+#            long_mode: CLIP
+        - label:
+            id: info_sd
+            text: "--"
+            text_font: font_info
+            text_color: 0xf2efe8
+            x: 140
+            y: 236
+            width: 330
             height: 32
             long_mode: CLIP
             text_align: RIGHT
@@ -2207,7 +2648,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 244
+            y: 265
             width: 140
             height: 32
             long_mode: CLIP
@@ -2217,7 +2658,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 150
-            y: 244
+            y: 265
             width: 320
             height: 32
             long_mode: CLIP
@@ -2227,7 +2668,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 274
+            y: 294
             width: 185
             height: 32
             long_mode: CLIP
@@ -2237,7 +2678,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 274
+            y: 294
             width: 275
             height: 32
             long_mode: CLIP
@@ -2247,7 +2688,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 304
+            y: 323
             width: 185
             height: 32
             long_mode: CLIP
@@ -2257,7 +2698,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 304
+            y: 323
             width: 275
             height: 32
             long_mode: CLIP
@@ -2267,7 +2708,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 334
+            y: 352
             width: 185
             height: 32
             long_mode: CLIP
@@ -2277,7 +2718,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 334
+            y: 352
             width: 275
             height: 32
             long_mode: CLIP
@@ -2287,7 +2728,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 364
+            y: 381
             width: 185
             height: 32
             long_mode: CLIP
@@ -2297,7 +2738,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 195
-            y: 364
+            y: 381
             width: 275
             height: 32
             long_mode: CLIP
@@ -2307,7 +2748,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 394
+            y: 410
             width: 140
             height: 32
             long_mode: CLIP
@@ -2317,7 +2758,7 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 150
-            y: 394
+            y: 410
             width: 320
             height: 32
             long_mode: CLIP
@@ -2327,7 +2768,7 @@ lvgl:
             text_font: font_info
             text_color: 0x888888
             x: 10
-            y: 424
+            y: 439
             width: 145
             height: 32
             long_mode: CLIP
@@ -2337,11 +2778,11 @@ lvgl:
             text_font: font_info
             text_color: 0xf2efe8
             x: 155
-            y: 424
+            y: 439
             width: 315
             height: 32
             long_mode: CLIP
-            text_align: RIGHT
+            text_align: RIGHT    
     - id: page_quote
       bg_color: 0x050504
       on_swipe_left:
@@ -2349,10 +2790,17 @@ lvgl:
           - lambda: |-
               lv_indev_wait_release(lv_indev_get_act());
               int n = id(g_count);
+              int shcnt = id(g_shcnt);
               if (n > 1) {
                 int i = id(g_index) + 1;
-                if (i >= n) i = 0;
+                ESP_LOGD("swipe_left","before n: %d, i: %d, shcnt: %d",n,i,shcnt);
+                if (shcnt>1) {
+                  if (i > n) i = 0;
+                } else {
+                  if (i >= n) i = 0;
+                }
                 id(g_index) = i;
+                ESP_LOGD("swipe_left","after n: %d, i: %d, shcnt: %d",n,i,shcnt);
                 lv_label_set_text(id(lbl_name), "");
               }
           - script.execute: paint_active
@@ -2365,10 +2813,15 @@ lvgl:
           - lambda: |-
                 lv_indev_wait_release(lv_indev_get_act());
                 int n = id(g_count);
+                int shcnt = id(g_shcnt);
                 if (n > 1) {
                   int i = id(g_index) - 1;
-                  if (i < 0) i = n - 1;
+                  ESP_LOGD("swipe_right","before n: %d, i: %d, shcnt: %d",n,i,shcnt);
+                  if (i < 0) {
+                    if(shcnt>1) i = n; else i = n - 1;
+                  }
                   id(g_index) = i;
+                  ESP_LOGD("swipe_right","after n: %d, i: %d, shcnt: %d",n,i,shcnt);
                   lv_label_set_text(id(lbl_name), "");
                 }
           - script.execute: paint_active
@@ -2387,13 +2840,36 @@ lvgl:
           - lambda: "lv_indev_wait_release(lv_indev_get_act());"
           - lvgl.page.show:
               id: page_info
+          - lambda: |-
+              if (!stoxbox_sd_mount()) {
+                ESP_LOGW("stoxbox_sd", "SD card not mounted; using firmware images");
+              } else {
+                stoxbox_sd_apply_assets(id(splash_logo_img), id(back_img_quote), id(back_img_setup), id(back_img_info));
+              }              
       on_double_click:
         then:
           - lambda: |-
-              id(g_show_value) = !id(g_show_value);
+              if(id(g_count) == id(g_index)) {
+                id(g_sum_in_usd) = !id(g_sum_in_usd);
+              } else {
+                id(g_show_value) = !id(g_show_value);
+              }
+              global_preferences->sync();
+              id(ha_showval).publish_state(id(g_show_value));
+              id(ha_sumusd).publish_state(id(g_sum_in_usd));
+          - script.execute: persist_settings
+          - lvgl.widget.update:
+              id: sw_sumusd
+              state:
+                checked: !lambda return id(g_sum_in_usd);              
+          - lvgl.widget.update:
+              id: sw_showval
+              state:
+                checked: !lambda return id(g_show_value);              
           - script.execute: paint_active    
       widgets:
         - image:
+            id: back_img_quote
             src: img_back
             x: 0
             y: 0
@@ -2409,6 +2885,29 @@ lvgl:
             width: 480
             height: 60
             text_align: CENTER
+        - label: 
+            id: lbl_sumticker
+            text: ""
+            x: 10
+            y: 0
+            width: 230
+            height: 444
+            bg_color: black
+            bg_opa: 0
+            text_color: 0xffffff
+            text_font: font_value
+        - label: 
+            id: lbl_sumvalue
+            text: ""
+            x: 240
+            y: 0
+            width: 230
+            height: 444
+            bg_color: black
+            bg_opa: 0
+            text_color: 0xffffff
+            text_font: font_value
+            text_align: RIGHT
         - label:
             id: lbl_name
             text: ""
@@ -2426,9 +2925,10 @@ lvgl:
             height: 40
             radius: 10
             bg_color: 0x224422
-            bg_opa: 50%
-            border_width: 1
-            border_color: 0x3dcf8e
+            bg_opa: 20%
+            border_width: 0
+#            border_color: 0x3dcf8e
+#            border_opa: 20%
             pad_all: 0
             hidden: true
             widgets:
@@ -2437,6 +2937,25 @@ lvgl:
                   text: "-----"
                   text_font: font_ui
                   text_color: 0x3dcf8e
+                  align: CENTER
+        - obj:
+            id: http_box
+            x: 310
+            y: 8
+            width: 60
+            height: 24
+            radius: 10
+            bg_color: 0x656722
+            bg_opa: 50%
+            border_width: 0
+#            border_color: 0x3dcf8e
+            pad_all: 0
+            widgets:
+              - label:
+                  id: lbl_http
+                  text: "http"
+                  text_font: font_small
+                  text_color: 0xeece08
                   align: CENTER
         - label:
             id: lbl_price
@@ -2521,7 +3040,7 @@ lvgl:
         - label:
             id: ticker_0
             text: ""
-            text_font: font_ui
+            text_font: font_ticker
             text_color: 0x444444
             width: 96
             height: 28
@@ -2531,7 +3050,7 @@ lvgl:
         - label:
             id: ticker_1
             text: ""
-            text_font: font_ui
+            text_font: font_ticker
             text_color: 0x444444
             width: 80
             height: 28
@@ -2541,7 +3060,7 @@ lvgl:
         - label:
             id: ticker_2
             text: ""
-            text_font: font_ui
+            text_font: font_ticker
             text_color: 0x444444
             width: 80
             height: 28
@@ -2551,7 +3070,7 @@ lvgl:
         - label:
             id: ticker_3
             text: ""
-            text_font: font_ui
+            text_font: font_ticker
             text_color: 0x444444
             width: 80
             height: 28
@@ -2561,7 +3080,7 @@ lvgl:
         - label:
             id: ticker_4
             text: ""
-            text_font: font_ui
+            text_font: font_ticker
             text_color: 0x444444
             width: 80
             height: 28
@@ -2571,16 +3090,27 @@ lvgl:
         - label:
             id: ticker_5
             text: ""
-            text_font: font_ui
+            text_font: font_ticker
             text_color: 0x444444
             width: 80
             height: 28
             x: 320
             y: 454             # x,y will be changed in paint_active
             text_align: CENTER
+        - label:
+            id: ticker_sum
+            text: "SUM"
+            text_font: font_ticker
+            text_color: 0xdddd00
+            width: 60
+            height: 28
+            x: 420
+            y: 453             # x,y will be changed in paint_active
+            text_align: CENTER
+            hidden: true
     - id: page_setup
       skip: false
-      bg_color: 0x050504
+#      bg_color: 0x050504
       scrollbar_mode: "OFF"
       scrollable: false
       on_load:
@@ -2592,6 +3122,7 @@ lvgl:
         then:
           - lambda: |-
                 lv_indev_wait_release(lv_indev_get_act());
+          - script.execute: commit_setup_fields
           - light.turn_off: display_backlight    
           - lvgl.page.show:
               id: page_info
@@ -2601,10 +3132,12 @@ lvgl:
         then:
           - lambda: |-
                 lv_indev_wait_release(lv_indev_get_act());
+          - script.execute: commit_setup_fields
           - lvgl.page.show:
               id: page_quote
       widgets:
         - image:
+            id: back_img_setup
             src: img_back
             x: 0
             y: 0
@@ -2651,9 +3184,12 @@ lvgl:
                       return false;
                     }
                     id(g_tickers_raw) = new_val;
+                    id(ha_ticker_list).publish_state(new_val);
+                    global_preferences->sync();
                     return true;
                 then:
                   - script.execute: get_tickers
+                  - script.execute: fetch_all
             on_focus:
               then:
                 - lvgl.widget.show: setup_kb
@@ -2702,9 +3238,11 @@ lvgl:
                       return false;
                     }
                     id(g_shares_raw) = new_val;
+                    id(ha_shares_list).publish_state(new_val);
+                    global_preferences->sync();
                     return true;
                 then:
-                  - script.execute: get_shares               
+                  - script.execute: get_shares
             on_focus:
               then:
                 - lvgl.widget.show: setup_kb
@@ -2754,6 +3292,8 @@ lvgl:
                       return false; 
                     }
                     id(g_currency_code) = new_val;
+                    id(ha_currency).publish_state(new_val);
+                    global_preferences->sync();
                     return true;
                 then:
                   - script.execute: fetch_currency
@@ -2809,39 +3349,44 @@ lvgl:
                           else if (idx == 2) id(g_rotation) = 180;
                           else if (idx == 3) id(g_rotation) = 270;
                           else id(g_rotation) = 0;
-                      - lvgl.page.show:
-                          id: page_setup
+                          global_preferences->sync();
                       - script.execute: apply_rotation
         - label:
             text: "Backlight"
             text_font: font_ui
             text_color: 0x8a8780
             x: 8
-            y: 218
+            y: 234
         - slider:
             id: backlight_slider
-            x: 8
-            y: 250
-            width: 464
+            x: 118
+            y: 234
+            width: 348
             height: 28
-            min_value: 1
+            min_value: 20
             max_value: 100
             value: 50
             ext_click_area: 12
             on_release:
               then:
+                - lambda: |-
+                    int v = (int) x;
+                    if (v < 20) v = 20;
+                    if (v > 100) v = 100;
+                    id(g_backlight) = v;
+                    global_preferences->sync();
                 - light.turn_on:
                     id: display_backlight
-                    brightness: !lambda 'return x / 100.0f;'
+                    brightness: !lambda 'return id(g_backlight) / 100.0f;'
         - label:
-            text: "Relay1"
+            text: "Relays"
             text_font: font_ui
             text_color: 0x8a8780
             x: 8
             y: 294
         - switch:
             id: sw_relay1
-            x: 82
+            x: 128
             y: 290
             width: 80
             height: 40
@@ -2854,26 +3399,87 @@ lvgl:
             on_value:
               - if:
                   condition:
-                    lambda: 'return !id(g_relay1);'
+                    lambda: 'return !id(g_relay1_change);'
                   then:
-                    - lambda: 'id(g_relay1) = true;'
+                    - lambda: 'id(g_relay1_change) = true;'
                     - if:
                         condition:
-                          lambda: 'return x;' # 'x' az LVGL kapcsoló aktuális állapota (true/false)
+                          lambda: |-
+                            id(g_relay1) = x;
+                            return x;
                         then:
                           - switch.turn_on: ha_relay1
                         else:
                           - switch.turn_off: ha_relay1
-                    - lambda: 'id(g_relay1) = false;'
+                    - lambda: 'id(g_relay1_change) = false;'
+                    - script.execute: persist_settings
+        - switch:
+            id: sw_relay2
+            x: 216
+            y: 290
+            width: 80
+            height: 40
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            state:
+              checked: true   
+            on_value:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_relay2_change);'
+                  then:
+                    - lambda: 'id(g_relay2_change) = true;'
+                    - if:
+                        condition:
+                          lambda: |-
+                            id(g_relay2) = x;
+                            return x;
+                        then:
+                          - switch.turn_on: ha_relay2
+                        else:
+                          - switch.turn_off: ha_relay2
+                    - lambda: 'id(g_relay2_change) = false;'
+                    - script.execute: persist_settings
+        - switch:
+            id: sw_relay3
+            x: 304
+            y: 290
+            width: 80
+            height: 40
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            state:
+              checked: true   
+            on_value:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_relay3_change);'
+                  then:
+                    - lambda: 'id(g_relay3_change) = true;'
+                    - if:
+                        condition:
+                          lambda: |-
+                            id(g_relay3) = x;
+                            return x;
+                        then:
+                          - switch.turn_on: ha_relay3
+                        else:
+                          - switch.turn_off: ha_relay3
+                    - lambda: 'id(g_relay3_change) = false;'
+                    - script.execute: persist_settings
         - label:
-            text: "Relay2"
+            text: "Show value"
             text_font: font_ui
             text_color: 0x8a8780
             x: 8
             y: 344
         - switch:
-            id: sw_relay2
-            x: 82
+            id: sw_showval
+            x: 128
             y: 340
             width: 80
             height: 40
@@ -2886,26 +3492,30 @@ lvgl:
             on_value:
               - if:
                   condition:
-                    lambda: 'return !id(g_relay2);'
+                    lambda: 'return !id(g_showval_change);'
                   then:
-                    - lambda: 'id(g_relay2) = true;'
+                    - lambda: 'id(g_showval_change) = true;'
                     - if:
                         condition:
-                          lambda: 'return x;' # 'x' az LVGL kapcsoló aktuális állapota (true/false)
+                          lambda: |-
+                            id(g_show_value)=x;
+                            return x;
                         then:
-                          - switch.turn_on: ha_relay2
+                          - switch.turn_on: ha_showval
                         else:
-                          - switch.turn_off: ha_relay2
-                    - lambda: 'id(g_relay2) = false;'
+                          - switch.turn_off: ha_showval
+                    - lambda: 'id(g_showval_change) = false;'
+                    - script.execute: persist_settings
+                    - script.execute: paint_active  
         - label:
-            text: "Relay3"
+            text: "Sum in USD"
             text_font: font_ui
             text_color: 0x8a8780
             x: 8
             y: 394
         - switch:
-            id: sw_relay3
-            x: 82
+            id: sw_sumusd
+            x: 128
             y: 390
             width: 80
             height: 40
@@ -2918,17 +3528,21 @@ lvgl:
             on_value:
               - if:
                   condition:
-                    lambda: 'return !id(g_relay3);'
+                    lambda: 'return !id(g_sumusd_change);'
                   then:
-                    - lambda: 'id(g_relay3) = true;'
+                    - lambda: 'id(g_sumusd_change) = true;'
                     - if:
                         condition:
-                          lambda: 'return x;' # 'x' az LVGL kapcsoló aktuális állapota (true/false)
+                          lambda: |-
+                            id(g_sum_in_usd) = x;
+                            return x;
                         then:
-                          - switch.turn_on: ha_relay3
+                          - switch.turn_on: ha_sumusd
                         else:
-                          - switch.turn_off: ha_relay3
-                    - lambda: 'id(g_relay3) = false;'
+                          - switch.turn_off: ha_sumusd
+                    - lambda: 'id(g_sumusd_change) = false;'
+                    - script.execute: persist_settings
+                    - script.execute: paint_active  
         - button:
             id: restart_button
             x: 366
@@ -3020,6 +3634,7 @@ select:
                 else if (x == "180°") deg = 180;
                 else if (x == "270°") deg = 270;
                 id(g_rotation) = deg;
+                global_preferences->sync();
             - script.execute: apply_rotation
 
 text:
@@ -3028,7 +3643,7 @@ text:
     id: ha_currency
     icon: "mdi:currency-usd"
     optimistic: true
-    restore_value: true
+    restore_value: false
     initial_value: "USD"
     min_length: 3
     max_length: 3
@@ -3041,6 +3656,7 @@ text:
             if (c >= 'a' && c <= 'z') id(g_currency_code)[ci] = (char)(c - 'a' + 'A');
           }
           if (id(g_currency_code).empty()) id(g_currency_code) = "USD";
+          global_preferences->sync();
       - lvgl.textarea.update:
           id: ta_currency
           text: !lambda 'return id(g_currency_code);'
@@ -3051,7 +3667,7 @@ text:
     id: ha_ticker_list
     icon: "mdi:format-list-bulleted"
     optimistic: true
-    restore_value: true
+    restore_value: false
     initial_value: "TSLA SPCX"
     min_length: 0
     max_length: 48
@@ -3059,10 +3675,12 @@ text:
     set_action:
       - lambda: |-
           id(g_tickers_raw) = x;
+          global_preferences->sync();
       - lvgl.textarea.update:
           id: ta_tickers
           text: !lambda 'return x;'
       - script.execute: get_tickers
+      - script.execute: paint_active  
       - script.execute: fetch_all
 
   - platform: template
@@ -3070,7 +3688,7 @@ text:
     id: ha_shares_list
     icon: "mdi:counter"
     optimistic: true
-    restore_value: true
+    restore_value: false
     initial_value: "100 0"
     min_length: 0
     max_length: 32
@@ -3078,10 +3696,12 @@ text:
     set_action:
       - lambda: |-
           id(g_shares_raw) = x;
+          global_preferences->sync();
       - lvgl.textarea.update:
           id: ta_shares
           text: !lambda 'return x;'
       - script.execute: get_shares
+      - script.execute: paint_active  
       - script.execute: fetch_all
 
 sensor:
@@ -3104,7 +3724,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 1 || id(g_price_0) <= 0) return NAN;
         return id(g_price_0);
@@ -3116,7 +3736,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 1 || id(g_price_0) <= 0) return NAN;
         return id(g_price_0) * id(g_sh_0);
@@ -3128,7 +3748,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 2 || id(g_price_1) <= 0) return NAN;
         return id(g_price_1);
@@ -3140,7 +3760,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 2 || id(g_price_1) <= 0) return NAN;
         return id(g_price_1) * id(g_sh_1);
@@ -3152,7 +3772,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 3 || id(g_price_2) <= 0) return NAN;
         return id(g_price_2);
@@ -3164,7 +3784,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 3 || id(g_price_2) <= 0) return NAN;
         return id(g_price_2) * id(g_sh_2);
@@ -3176,7 +3796,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 4 || id(g_price_3) <= 0) return NAN;
         return id(g_price_3);
@@ -3188,7 +3808,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 4 || id(g_price_3) <= 0) return NAN;
         return id(g_price_3) * id(g_sh_3);
@@ -3200,7 +3820,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 5 || id(g_price_4) <= 0) return NAN;
         return id(g_price_4);
@@ -3212,7 +3832,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 5 || id(g_price_4) <= 0) return NAN;
         return id(g_price_4) * id(g_sh_4);        
@@ -3224,7 +3844,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 6 || id(g_price_5) <= 0) return NAN;
         return id(g_price_5);
@@ -3236,7 +3856,7 @@ sensor:
     accuracy_decimals: 2
     device_class: monetary
     state_class: measurement
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 6 || id(g_price_5) <= 0) return NAN;
         return id(g_price_5) * id(g_sh_5);        
@@ -3262,7 +3882,7 @@ text_sensor:
   - platform: template
     name: "Ticker 1 symbol"
     id: ha_sym_0
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 1) return std::string("");
         return id(g_sym_0);
@@ -3270,7 +3890,7 @@ text_sensor:
   - platform: template
     name: "Ticker 2 symbol"
     id: ha_sym_1
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 2) return std::string("");
         return id(g_sym_1);
@@ -3278,7 +3898,7 @@ text_sensor:
   - platform: template
     name: "Ticker 3 symbol"
     id: ha_sym_2
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 3) return std::string("");
         return id(g_sym_2);
@@ -3286,7 +3906,7 @@ text_sensor:
   - platform: template
     name: "Ticker 4 symbol"
     id: ha_sym_3
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 4) return std::string("");
         return id(g_sym_3);
@@ -3294,7 +3914,7 @@ text_sensor:
   - platform: template
     name: "Ticker 5 symbol"
     id: ha_sym_4
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 5) return std::string("");
         return id(g_sym_4);
@@ -3302,12 +3922,20 @@ text_sensor:
   - platform: template
     name: "Ticker 6 symbol"
     id: ha_sym_5
-    update_interval: ${poll_seconds}
+    update_interval: ${poll_seconds}s
     lambda: |-
         if (id(g_count) < 6) return std::string("");
         return id(g_sym_5);
 
 button:
+  - platform: template
+    name: "Take screenshot (SD)"
+    id: ha_screenshot_sd
+    icon: "mdi:camera"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: save_screenshot_sd
+
   - platform: template
     name: Refresh quotes
     id: ha_refresh
@@ -3318,78 +3946,169 @@ switch:
   - platform: gpio
     pin: 40
     id: ha_relay1
-    name: 'Relay 1'        
+    name: 'Relay 1'
+    restore_mode: DISABLED
     on_turn_on:
       - if:
           condition:
-            lambda: 'return !id(g_relay1);'
+            lambda: 'return !id(g_relay1_change);'
           then:
-            - lambda: 'id(g_relay1) = true;'
+            - lambda: |-
+                id(g_relay1_change) = true;
+                id(g_relay1) = true;
             - lvgl.widget.update:
                 id: sw_relay1
                 state:
                   checked: true
-            - lambda: 'id(g_relay1) = false;'
+            - lambda: 'id(g_relay1_change) = false;'
+            - script.execute: persist_settings
     on_turn_off:
       - if:
           condition:
-            lambda: 'return !id(g_relay1);'
+            lambda: 'return !id(g_relay1_change);'
           then:
-            - lambda: 'id(g_relay1) = true;'
+            - lambda: |-
+                id(g_relay1_change) = true;
+                id(g_relay1) = false;
             - lvgl.widget.update:
                 id: sw_relay1
                 state:
                   checked: false
-            - lambda: 'id(g_relay1) = false;'
+            - lambda: 'id(g_relay1_change) = false;'
+            - script.execute: persist_settings
   - platform: gpio
     pin: 2
     id: ha_relay2
-    name: 'Relay 2'        
+    name: 'Relay 2'
+    restore_mode: DISABLED
     on_turn_on:
       - if:
           condition:
-            lambda: 'return !id(g_relay2);'
+            lambda: 'return !id(g_relay2_change);'
           then:
-            - lambda: 'id(g_relay2) = true;'
+            - lambda: |-
+                id(g_relay2_change) = true;
+                id(g_relay2) = true;
             - lvgl.widget.update:
                 id: sw_relay2
                 state:
                   checked: true
-            - lambda: 'id(g_relay2) = false;'
+            - lambda: 'id(g_relay2_change) = false;'
+            - script.execute: persist_settings
     on_turn_off:
       - if:
           condition:
-            lambda: 'return !id(g_relay2);'
+            lambda: 'return !id(g_relay2_change);'
           then:
-            - lambda: 'id(g_relay2) = true;'
+            - lambda: |-
+                id(g_relay2_change) = true;
+                id(g_relay2) = false;
             - lvgl.widget.update:
                 id: sw_relay2
                 state:
                   checked: false
-            - lambda: 'id(g_relay2) = false;'              
+            - lambda: 'id(g_relay2_change) = false;'
+            - script.execute: persist_settings
   - platform: gpio
     pin: 1
     id: ha_relay3
-    name: 'Relay 3'        
+    name: 'Relay 3'
+    restore_mode: DISABLED
     on_turn_on:
       - if:
           condition:
-            lambda: 'return !id(g_relay3);'
+            lambda: 'return !id(g_relay3_change);'
           then:
-            - lambda: 'id(g_relay3) = true;'
+            - lambda: |-
+                id(g_relay3_change) = true;
+                id(g_relay3) = true;
             - lvgl.widget.update:
                 id: sw_relay3
                 state:
                   checked: true
-            - lambda: 'id(g_relay3) = false;'
+            - lambda: 'id(g_relay3_change) = false;'
+            - script.execute: persist_settings
     on_turn_off:
       - if:
           condition:
-            lambda: 'return !id(g_relay3);'
+            lambda: 'return !id(g_relay3_change);'
           then:
-            - lambda: 'id(g_relay3) = true;'
+            - lambda: |-
+                id(g_relay3_change) = true;
+                id(g_relay3) = false;
             - lvgl.widget.update:
                 id: sw_relay3
                 state:
                   checked: false
-            - lambda: 'id(g_relay3) = false;'                            
+            - lambda: 'id(g_relay3_change) = false;'
+            - script.execute: persist_settings
+  - platform: template
+    id: ha_showval
+    name: "Show value"
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return !id(g_showval_change);'
+          then:
+            - lambda: 'id(g_showval_change) = true;'
+            - lvgl.widget.update:
+                id: sw_showval
+                state:
+                  checked: true
+            - lambda: |-
+                id(g_showval_change) = false;
+                id(g_show_value) = true;
+            - script.execute: persist_settings
+            - script.execute: paint_active  
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return !id(g_showval_change);'
+          then:
+            - lambda: 'id(g_showval_change) = true;'
+            - lvgl.widget.update:
+                id: sw_showval
+                state:
+                  checked: false
+            - lambda: |-
+                id(g_showval_change) = false;
+                id(g_show_value) = false;
+            - script.execute: persist_settings
+            - script.execute: paint_active  
+  - platform: template
+    id: ha_sumusd
+    name: "Sum in USD"
+    optimistic: true
+    restore_mode: DISABLED
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return !id(g_sumusd_change);'
+          then:
+            - lambda: 'id(g_sumusd_change) = true;'
+            - lvgl.widget.update:
+                id: sw_sumusd
+                state:
+                  checked: true
+            - lambda: |-
+                id(g_sumusd_change) = false;
+                id(g_sum_in_usd) = true;
+            - script.execute: persist_settings
+            - script.execute: paint_active  
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return !id(g_sumusd_change);'
+          then:
+            - lambda: 'id(g_sumusd_change) = true;'
+            - lvgl.widget.update:
+                id: sw_sumusd
+                state:
+                  checked: false
+            - lambda: |-
+                id(g_sumusd_change) = false;
+                id(g_sum_in_usd) = false;
+            - script.execute: persist_settings
+            - script.execute: paint_active
