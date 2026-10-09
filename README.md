@@ -91,6 +91,7 @@ At minimum, keep these files together:
 ```text
 .
 ├── stoxbox.yaml
+├── stoxbox_sd.h
 ├── secrets.yaml
 ├── logo.png
 └── back.png
@@ -124,8 +125,8 @@ The default configuration includes:
 ```yaml
 substitutions:
   device_name: stoxbox
-  poll_seconds: "60s"
-  app_version: "0.3"
+  poll_seconds: "60"
+  app_version: "0.6"
   ha_topic: "stoxbox/quote"
 ```
 
