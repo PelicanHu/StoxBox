@@ -3052,6 +3052,9 @@ lvgl:
                 - lambda: |-
                     id(g_index) = 0;
                 - script.execute: paint_active
+                - lambda: |-  
+                    lv_timer_handler();
+                - delay: 50ms    
                 - script.execute: fetch_current_if_due            
         - label:
             id: ticker_1
@@ -3068,6 +3071,9 @@ lvgl:
                 - lambda: |-
                     id(g_index) = 1;
                 - script.execute: paint_active
+                - lambda: |-  
+                    lv_timer_handler();
+                - delay: 50ms    
                 - script.execute: fetch_current_if_due            
         - label:
             id: ticker_2
@@ -3084,6 +3090,9 @@ lvgl:
                 - lambda: |-
                     id(g_index) = 2;
                 - script.execute: paint_active
+                - lambda: |-  
+                    lv_timer_handler();
+                - delay: 50ms    
                 - script.execute: fetch_current_if_due            
         - label:
             id: ticker_3
@@ -3116,6 +3125,9 @@ lvgl:
                 - lambda: |-
                     id(g_index) = 4;
                 - script.execute: paint_active
+                - lambda: |-  
+                    lv_timer_handler();
+                - delay: 50ms    
                 - script.execute: fetch_current_if_due            
         - label:
             id: ticker_5
@@ -3132,6 +3144,9 @@ lvgl:
                 - lambda: |-
                     id(g_index) = 5;
                 - script.execute: paint_active
+                - lambda: |-  
+                    lv_timer_handler();
+                - delay: 50ms    
                 - script.execute: fetch_current_if_due            
         - label:
             id: ticker_sum
