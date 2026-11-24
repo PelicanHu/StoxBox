@@ -6,7 +6,7 @@
 #
 # SD card (Guition 4848S040): SPI CLK=GPIO48, MOSI=GPIO47, MISO=GPIO41, CS=GPIO42.
 # Optional SD assets: /sd/LOGO.PNG and /sd/BACK.PNG.
-# HA button "Take screenshot (SD)" writes /sd/screenshot.bmp.
+# HA button "Take screenshot (SD)" writes /sd/SCR_XXXX.BMP.
 #
 # secrets.yaml:
 #   wifi_ssid / wifi_password / api_encryption_key
