@@ -6,7 +6,7 @@
 #
 # SD card (Guition 4848S040): SPI CLK=GPIO48, MOSI=GPIO47, MISO=GPIO41, CS=GPIO42.
 # Optional SD assets: /sd/LOGO.PNG and /sd/BACK.PNG.
-# HA button "Take screenshot (SD)" writes /sd/SCR_xxxx.BMP.
+# HA button "Take screenshot (SD)" writes /sd/screenshot.bmp.
 #
 # secrets.yaml:
 #   wifi_ssid / wifi_password / api_encryption_key
@@ -14,14 +14,16 @@
 substitutions:
   device_name: stoxbox
   poll_seconds: "60"
-  app_version: "0.61"
+  app_version: "0.62"
   ha_topic: "stoxbox/quote"
+  wifi_ssid_default: !secret wifi_ssid
+  wifi_password_default: !secret wifi_password
   
 esphome:
   name: ${device_name}
   build_flags:
     - "-DLV_USE_SNAPSHOT=1"  
-    - "-DLV_USE_LODEPNG=1"        
+#    - "-DLV_USE_LODEPNG=1"        
   includes:
     - <esp_heap_caps.h>
     - <esp_system.h>
@@ -43,6 +45,9 @@ esphome:
         # until the persisted rotation has been validated and applied. This
         # prevents the splash screen from briefly appearing at 0 degrees.
         - lambda: |-
+            ESP_LOGI("restore", "rotation=%d", id(g_rotation));
+            ESP_LOGI("restore", "tickers='%s'", id(g_tickers_raw).c_str());
+            ESP_LOGI("restore", "shares='%s'", id(g_shares_raw).c_str());            
             int deg = id(g_rotation);
             if (deg != 0 && deg != 90 && deg != 180 && deg != 270) {
               id(g_rotation) = 0;
@@ -50,9 +55,9 @@ esphome:
         - lvgl.display.set_rotation:
             rotation: !lambda 'return id(g_rotation);'
         - lambda: |-
-            lv_label_set_text(id(lbl_appname), "StoxBox v${app_version}");
-            lv_obj_clear_flag(id(lbl_appname), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(id(lbl_author), LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(id(lbl_appname), "v${app_version}");
+            //lv_obj_set_hidden(id(lbl_appname), false);
+            //lv_obj_set_hidden(id(lbl_author), false);
         - lvgl.textarea.update:
             id: ta_tickers
             text: !lambda 'return id(g_tickers_raw);'
@@ -91,21 +96,6 @@ esphome:
               if (deg == 270) return 3;
               return 0;
         - lambda: |-
-            id(ha_ticker_list).publish_state(id(g_tickers_raw));
-            id(ha_shares_list).publish_state(id(g_shares_raw));
-            id(ha_currency).publish_state(id(g_currency_code));
-            id(ha_relay1).publish_state(id(g_relay1));
-            id(ha_relay2).publish_state(id(g_relay2));
-            id(ha_relay3).publish_state(id(g_relay3));
-            id(ha_showval).publish_state(id(g_show_value));
-            id(ha_sumusd).publish_state(id(g_sum_in_usd));
-            const char *rotation_options[4] = {"0°", "90°", "180°", "270°"};
-            int rotation_idx = 0;
-            if (id(g_rotation) == 90) rotation_idx = 1;
-            else if (id(g_rotation) == 180) rotation_idx = 2;
-            else if (id(g_rotation) == 270) rotation_idx = 3;
-            id(ha_rotation).publish_state(rotation_options[rotation_idx]);
-            
             id(g_loaded_0) = false;
             id(g_loaded_1) = false;
             id(g_loaded_2) = false;
@@ -137,6 +127,14 @@ esphome:
             std::string mac = id(wifi_mac_info).state;
             snprintf(b, sizeof(b), "MAC: %s", mac.empty() ? "--" : mac.c_str());
             lv_label_set_text(id(info_mac), b);
+            if (id(g_ssid).empty()) {
+              id(g_ssid) = "${wifi_ssid_default}";
+            }
+            if (id(g_password).empty()) {
+              id(g_password) = "${wifi_password_default}";
+            }
+            lv_textarea_set_text(id(ta_ssid),id(g_ssid).c_str());
+            lv_textarea_set_text(id(ta_password),id(g_password).c_str());
 
         - script.execute: apply_saved_switches
 
@@ -161,24 +159,24 @@ esphome:
             id: page_splash
             animation: fade_in
             time: 250ms          
+        - script.execute: connect_wifi    
         - wait_until:
             condition:
               wifi.connected:
             timeout: 30s
-        - lambda: |-
-            // SSID
-            std::string ssid = id(wifi_ssid_info).state;
-            lv_label_set_text(id(info_ssid), ssid.empty() ? "" : ssid.c_str());
-        - delay: 2s
-        - script.execute: fetch_currency
-        - script.wait: fetch_currency  
-        - script.execute: get_tickers_shares
-        - script.execute:
-            id: fetch_one
-            slot: 0
-        - lvgl.page.show:
-            id: page_quote
-        - script.execute: fetch_all
+        - if:
+            condition:
+              wifi.connected:
+            then:
+              - lambda: |-
+                   ESP_LOGI("main", "Wi-Fi connected");
+                   lv_label_set_text(id(lbl_boot_status), "Wi-Fi connected.");
+            else:
+              - lambda: |-
+                  ESP_LOGE("main", "Wi-Fi time-out! Boot process stopped.");
+              - lvgl.page.show: page_wifi_setup    
+              
+              
 esp32:
   variant: esp32s3
   flash_size: 16MB
@@ -206,7 +204,8 @@ psram:
   speed: 80MHz
 
 logger:
-
+  hardware_uart: UART0
+  
 preferences:
   id: stoxbox_preferences
   flash_write_interval: 5s
@@ -215,6 +214,9 @@ api:
   encryption:
     key: !secret stoxbox__encryption_key
   on_client_connected:
+    - lambda: |-
+         ESP_LOGI("main", "API connected");
+         lv_label_set_text(id(lbl_boot_status), "API connected.");    
     - script.execute: publish_config_to_ha
 
 ota:
@@ -223,7 +225,7 @@ ota:
       - lvgl.page.show: 
           id: page_splash
       - lambda: |-
-          lv_obj_clear_flag(id(ota_box), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_set_hidden(id(ota_box), false);
           lv_timer_handler();
     on_end:
       then:
@@ -231,15 +233,19 @@ ota:
     on_progress:
       then:
         - lambda: |-
-            lv_bar_set_value(id(ota_progress_bar),(int)x+5,LV_ANIM_OFF);
+            lv_bar_set_value(id(ota_progress_bar),(int)x,LV_ANIM_ON);
             if (x >= 94.0f) {
               id(backlight_output).set_level(0.0f);
             }
             lv_timer_handler();
 
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
+  enable_on_boot: false
+  reboot_timeout: 0s  
+#  ssid: "${wifi_ssid_default}"
+#  password: "${wifi_password_default}"  
+#  ssid: !secret wifi_ssid
+#  password: !secret wifi_password
   use_address: 192.168.0.20
   ap:
     ssid: StoxBox-Setup
@@ -347,7 +353,7 @@ touchscreen:
 # selected at runtime after the LVGL objects are created.
 image:
   - platform: file
-    file: "logo.png"
+    file: "logo16.png"
     id: img_logo
     type: RGB565
     resize: 480x480
@@ -370,6 +376,10 @@ font:
     id: font_value
     size: 52
     glyphs: "0123456789.,-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz$€£¥ ֏ƒ৳č₾₪₹៛₩₸₭ден₮₱ł₽฿₺₴₫"
+  - file: "gfonts://Google Sans@700"
+    id: font_version
+    size: 52
+    glyphs: "0123456789.v"
   - file: "gfonts://Google Sans"
     id: font_qty
     size: 26
@@ -381,7 +391,7 @@ font:
   - file: "gfonts://Google Sans@700"
     id: font_ticker
     size: 22
-    glyphs: ".ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    glyphs: " ,.-:;ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
   - file: "gfonts://Google Sans"
     id: font_setup
     size: 24
@@ -393,9 +403,17 @@ font:
   - file: "gfonts://Google Sans"
     id: font_small
     size: 14
-    glyphs: "htper"
+    glyphs: "htpero"
 
 globals:
+  - id: g_ssid
+    type: std::string
+    restore_value: yes
+#    initial_value: "${wifi_ssid_default}"
+  - id: g_password
+    type: std::string
+    restore_value: yes
+#    initial_value: "${wifi_password_default}"
   - id: g_tickers_raw
     type: std::string
     restore_value: yes
@@ -535,6 +553,10 @@ globals:
   - id: g_aftermarket
     type: bool
     restore_value: no
+    initial_value: "false"
+  - id: g_show_after_hours
+    type: bool
+    restore_value: yes
     initial_value: "false"
   - id: g_sym_0
     type: std::string
@@ -816,7 +838,6 @@ script:
       - delay: 500ms
       - lambda: |-
           esp_restart();
-
   # Write restored globals immediately. component.update alone can lose a
   # value changed in the same automation cycle.
   - id: persist_settings
@@ -825,7 +846,88 @@ script:
       - lambda: |-
           global_preferences->sync();
       - component.update: stoxbox_preferences
+  - id: publish_and_fetch
+    mode: single    
+    then:
+      - lambda: |-
+          id(ha_ticker_list).publish_state(id(g_tickers_raw));
+          id(ha_shares_list).publish_state(id(g_shares_raw));
+          id(ha_currency).publish_state(id(g_currency_code));
+          id(ha_relay1).publish_state(id(g_relay1));
+          id(ha_relay2).publish_state(id(g_relay2));
+          id(ha_relay3).publish_state(id(g_relay3));
+          id(ha_showval).publish_state(id(g_show_value));
+          id(ha_sumusd).publish_state(id(g_sum_in_usd));
+          const char *rotation_options[4] = {"0°", "90°", "180°", "270°"};
+          int rotation_idx = 0;
+          if (id(g_rotation) == 90) rotation_idx = 1;
+          else if (id(g_rotation) == 180) rotation_idx = 2;
+          else if (id(g_rotation) == 270) rotation_idx = 3;
+          id(ha_rotation).publish_state(rotation_options[rotation_idx]);
+      - lambda: |-
+          // SSID
+          std::string ssid = id(wifi_ssid_info).state;
+          lv_label_set_text(id(info_ssid), ssid.empty() ? "" : ssid.c_str());
+      - delay: 2s
+      - script.execute: fetch_currency
+      - script.wait: fetch_currency  
+      - script.execute: get_tickers_shares
+      - script.execute:
+          id: fetch_one
+          slot: 0
+      - lvgl.page.show:
+          id: page_quote
+      - script.execute: fetch_all
+  - id: connect_wifi
+    mode: restart
+    then:
+      - lvgl.page.show: page_splash
+      - lambda: |-
+          lv_label_set_text(id(lbl_boot_status), "Wi-Fi connecting...");
+      - wifi.configure:
+          ssid: !lambda "return id(g_ssid);"
+          password: !lambda "return id(g_password);"
+          save: true
+          timeout: 30s
+          on_connect:
+            then:
+              - logger.log: "Wi-Fi connected"
+              - delay: 2s
+              - script.execute: publish_and_fetch  
+          on_error:
+            then:
+              - logger.log: "Wi-Fi connection failed"        
+              - lvgl.page.show: page_wifi_setup
+  
+                
+  - id: apply_wifi_settings
+    mode: single
+    then:
+      - lambda: |-
+          const char *s = lv_textarea_get_text(id(ta_ssid));
+          const char *p = lv_textarea_get_text(id(ta_password));
 
+          id(g_ssid) = s ? s : "";
+          id(g_password) = p ? p : "";
+
+      - if:
+          condition:
+            lambda: |-
+              return !id(g_ssid).empty();
+          then:
+            - wifi.configure:
+                ssid: !lambda "return id(g_ssid);"
+                password: !lambda "return id(g_password);"
+                save: true
+                timeout: 30s
+                on_connect:
+                  then:
+                    - logger.log: "New Wi-Fi credentials connected successfully"
+                on_error:
+                  then:
+                    - logger.log: "Could not connect using the new Wi-Fi credentials"
+
+      - script.execute: publish_and_fetch                
   # Device is the source of truth for these fields. Republish after HA connects
   # so a stale HA restore cannot win.
   - id: publish_config_to_ha
@@ -1060,7 +1162,8 @@ script:
               char c = raw[k];
               if (c >= 'a' && c <= 'z') raw[k] = (char) (c - 'a' + 'A');
             }
-            lv_obj_add_flag(id(status_box), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_hidden(id(status_box),true);
+            lv_obj_set_hidden(id(status_box),true);
             std::string syms[6];
             int ns = 0;
             size_t p = 0;
@@ -1158,6 +1261,7 @@ script:
             for (int j=0; j<6; j++) if(shs[j]>0) shcnt++; 
             id(g_shcnt)=shcnt;
             bool showval = id(g_show_value);
+            bool showAH = id(g_show_after_hours);
             bool sumusd = id(g_sum_in_usd);
             bool sum = shcnt>1 && showval;
             float rate = id(g_fx_rate);
@@ -1165,15 +1269,15 @@ script:
               if (n < 1) i = 0; else if (i < 0 || i > n) i = 0;
               lv_color_t col = i==n ? lv_color_hex(0xffff00) : lv_color_hex(0x777700);
               lv_obj_set_style_text_color(id(ticker_sum), col, LV_PART_MAIN);
-              lv_obj_clear_flag(id(ticker_sum), LV_OBJ_FLAG_HIDDEN); 
+              lv_obj_set_hidden(id(ticker_sum), false); 
             } else {
               if (n < 1) i = 0; else if (i < 0 || i >= n) i = 0;
-              lv_obj_add_flag(id(ticker_sum), LV_OBJ_FLAG_HIDDEN); 
+              lv_obj_set_hidden(id(ticker_sum), true); 
             }
             if (i == n) {
-              lv_obj_add_flag(id(status_box), LV_OBJ_FLAG_HIDDEN); 
-              lv_obj_clear_flag(id(lbl_sumticker), LV_OBJ_FLAG_HIDDEN); 
-              lv_obj_clear_flag(id(lbl_sumvalue), LV_OBJ_FLAG_HIDDEN);
+              lv_obj_set_hidden(id(status_box),true); 
+              lv_obj_set_hidden(id(lbl_sumticker), false); 
+              lv_obj_set_hidden(id(lbl_sumvalue), false);
               char buf[96];
               buf[0] = '\0';
               for (int j = 0; j < 6; j++) {
@@ -1272,9 +1376,9 @@ script:
               lv_label_set_text(id(lbl_sumvalue), buf);
               
             } else {
-              lv_obj_add_flag(id(lbl_sumticker), LV_OBJ_FLAG_HIDDEN); 
-              lv_obj_add_flag(id(lbl_sumvalue), LV_OBJ_FLAG_HIDDEN); 
-              lv_obj_clear_flag(id(status_box), LV_OBJ_FLAG_HIDDEN); 
+              lv_obj_set_hidden(id(lbl_sumticker), true); 
+              lv_obj_set_hidden(id(lbl_sumvalue), true); 
+              lv_obj_set_hidden(id(status_box), false); 
             }
             id(g_index) = i;
             std::string sym = ""; 
@@ -1362,6 +1466,10 @@ script:
               lv_label_set_text(id(lbl_value), "");
               lv_label_set_text(id(lbl_qty), "");
             }  
+            bool open = id(g_market_open);
+            bool pre = id(g_premarket);
+            bool after = id(g_aftermarket);
+            bool closed = !(open || pre || after);
             if (ts > 0) {
               time_t tt = (time_t) ts;
               struct tm tmv;
@@ -1380,7 +1488,6 @@ script:
             } else {
               lv_label_set_text(id(lbl_when), "");
             }
-            bool open = id(g_market_open);
             if (open) {
               lv_label_set_text(id(lbl_status), "OPEN");
               lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x3DCF8E), LV_PART_MAIN);
@@ -1388,8 +1495,6 @@ script:
               lv_obj_set_x(id(status_box), 390); lv_obj_set_width(id(status_box), 90);
               lv_obj_set_x(id(http_box), 390-64);               
             } else {
-              bool pre=id(g_premarket);
-              bool after=id(g_aftermarket);
               if (pre) { 
                 lv_label_set_text(id(lbl_status), "PRE-MARKET");
                 lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xeeee4c), LV_PART_MAIN);
@@ -1419,9 +1524,9 @@ script:
             const int start_x = (480 -  (n + extr) * cell_w) / 2;
             for (int d = 0; d < 6; d++) {
               if (n < 1 || d >= n || syms[d][0] == '\0') {
-                lv_obj_add_flag(tickers[d], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_hidden(tickers[d], true);
               } else {
-                lv_obj_clear_flag(tickers[d], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_hidden(tickers[d], false);
                 lv_label_set_text(tickers[d], syms[d]);
                 lv_obj_set_pos(tickers[d], start_x + d * cell_w, 453);
                 lv_obj_set_width(tickers[d], cell_w);
@@ -1432,11 +1537,11 @@ script:
                   bool up = chgs[d] >= 0.0f;
                   bright = up ? lv_color_hex(0x3DCF8E) : lv_color_hex(0xEF5D5D);
                   dim = up ? lv_color_hex(0x267A58) : lv_color_hex(0x8F3838);
-                  if(i == d) lv_obj_add_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN); 
+                  if(i == d) lv_obj_set_hidden(id(lbl_loading), true); 
                 } else {
                   bright = lv_color_hex(0x777777);
                   dim = lv_color_hex(0x444444);
-                  if(i == d) lv_obj_clear_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);                  
+                  if(i == d) lv_obj_set_hidden(id(lbl_loading), false);
                 }  
                 lv_obj_set_style_text_color(tickers[d], d == i ? bright : dim, LV_PART_MAIN);
               }
@@ -1456,7 +1561,6 @@ script:
             static float vals[MAX_POINTS];
             int vn = 0;
             size_t sp = 0;
-
             while (sp < spark.size() && vn < MAX_POINTS) {
               while (sp < spark.size() && (spark[sp] == ' ' || spark[sp] == ',' || spark[sp] == '\n' || spark[sp] == '\r')) {
                 sp++;
@@ -1476,6 +1580,7 @@ script:
               vals[vn] = value;
               vn++;
             }
+            ESP_LOGD("paint_active","spark size %d values: %d",spark.size(),vn);     
 
             #if LVGL_VERSION_MAJOR >= 9
             static lv_point_precise_t pts[MAX_POINTS];
@@ -1490,11 +1595,11 @@ script:
             int pn = vn;
 
             if (pn == 0) {
-              lv_obj_add_flag(id(spark_line)->obj, LV_OBJ_FLAG_HIDDEN);
-              lv_obj_add_flag(id(prev_close_line)->obj, LV_OBJ_FLAG_HIDDEN);
-              lv_obj_add_flag(id(session_separator)->obj, LV_OBJ_FLAG_HIDDEN);
+              lv_obj_set_hidden(id(spark_line)->obj, true);
+              lv_obj_set_hidden(id(prev_close_line)->obj, true);
+              lv_obj_set_hidden(id(session_separator)->obj, true);
             } else {
-              lv_obj_clear_flag(id(spark_line)->obj, LV_OBJ_FLAG_HIDDEN);
+              lv_obj_set_hidden(id(spark_line)->obj, false);
 
               float mn = vals[0];
               float mx = vals[0];
@@ -1519,22 +1624,19 @@ script:
               // PRE:     04:00 -> 09:30
               // OPEN:    09:30 -> 16:00
               // AFTER:   09:30 -> 20:00
-              // CLOSED:  09:30 -> 16:00 
+              // CLOSED:  09:30 -> 16:00 or 09:30 -> 20:00
               // --------------------------------------------------
 
               int start_minutes = 9 * 60 + 30;
               int end_minutes   = 16 * 60;
 
-              bool pre = id(g_premarket);
-              bool after = id(g_aftermarket);
-
               if (pre) {
                 start_minutes = 4 * 60;
                 end_minutes = 9 * 60 + 30;
-              } else if (after) {
+              } else if ((after || closed) && showAH) {
                 start_minutes = 9 * 60 + 30;
                 end_minutes = 20 * 60;
-              }
+              } 
 
               int start_seconds = start_minutes * 60;
               int end_seconds = end_minutes * 60;
@@ -1583,10 +1685,8 @@ script:
 
               lv_obj_invalidate(id(spark_line).obj);
 
-              // --------------------------------------------------
               // Previous-day closing price horizontal line
-              // --------------------------------------------------
-
+              
               if (prev_close > 0.0f) {
 
                 float prev_t =
@@ -1607,10 +1707,7 @@ script:
                   2
                 );
 
-                lv_obj_clear_flag(
-                  id(prev_close_line).obj,
-                  LV_OBJ_FLAG_HIDDEN
-                );
+                lv_obj_set_hidden(id(prev_close_line).obj,false);
 
                 lv_obj_set_style_line_color(
                   id(prev_close_line).obj,
@@ -1624,18 +1721,13 @@ script:
 
               } else {
 
-                lv_obj_add_flag(
-                  id(prev_close_line).obj,
-                  LV_OBJ_FLAG_HIDDEN
-                );
+                lv_obj_set_hidden(id(prev_close_line).obj,true);
               }
 
-              // --------------------------------------------------
               // 16:00 vertical separator
-              // Only in AFTER HOURS mode
-              // --------------------------------------------------
+              // Only when AFTER HOURS data shows
 
-              if (after) {
+              if ((after || closed) && showAH) {
                 float separator_ratio =
                   (float)((16 * 60) - (9 * 60 + 30)) /
                   (float)((20 * 60) - (9 * 60 + 30));
@@ -1655,10 +1747,7 @@ script:
                   2
                 );
 
-                lv_obj_clear_flag(
-                  id(session_separator).obj,
-                  LV_OBJ_FLAG_HIDDEN
-                );
+                lv_obj_set_hidden(id(session_separator).obj,false);
 
                 lv_obj_set_style_line_color(
                   id(session_separator).obj,
@@ -1670,10 +1759,7 @@ script:
                   id(session_separator).obj
                 );
               } else {
-                lv_obj_add_flag(
-                  id(session_separator).obj,
-                  LV_OBJ_FLAG_HIDDEN
-                );
+                lv_obj_set_hidden(id(session_separator).obj,true);
               }
             }
   - id: paint_session
@@ -1823,7 +1909,7 @@ script:
                 return false;
               }
               lv_label_set_text(id(lbl_http), "http");
-              lv_obj_clear_flag(id(http_box), LV_OBJ_FLAG_HIDDEN);
+              lv_obj_set_hidden(id(http_box), false);
               lv_timer_handler();
               return true;
 
@@ -1837,6 +1923,7 @@ script:
                     if (i == 3) sym = id(g_sym_3);
                     if (i == 4) sym = id(g_sym_4);
                     if (i == 5) sym = id(g_sym_5);
+                    ESP_LOGD("fetch_one","============== FETCH_ONE: %s ==============",sym.c_str());
                     return std::string("https://query1.finance.yahoo.com/v8/finance/chart/") + sym + "?range=1d&interval=5m&includePrePost=true";
                 capture_response: true
                 max_response_buffer_size: 20480
@@ -1848,13 +1935,14 @@ script:
                         then:
                           - lambda: |-
                               std::string spark;
+                              ESP_LOGI("fetch_one", "HTTP body length: %u",  (unsigned) body.size());
                               bool parsed = json::parse_json(body, [&spark](JsonObject root) -> bool {
                                 int i = id(g_fetch_i); std::string sym;
                                 JsonVariant meta = root["chart"]["result"][0]["meta"];
                                 if (meta.isNull() ||
                                     (meta["regularMarketPrice"].isNull() &&
                                      meta["fulldayPrice"].isNull())) {
-                                  //lv_obj_clear_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);
+                                  //lv_obj_set_hidden(id(lbl_loading), false);
                                   if (i == 0) {
                                     id(g_price_0) = 0; id(g_chg_0) = 0; id(g_pct_0) = 0; id(g_hi_0) = 0; id(g_lo_0) = 0; id(g_ts_0) = 0; id(g_loaded_0) = false;
                                     sym = id(g_sym_0); id(g_name_0) = sym;
@@ -1881,8 +1969,12 @@ script:
                                   }    
                                   return false;
                                 }
-                                bool preaft=id(g_premarket) || id(g_aftermarket);
+                                bool pre = id(g_premarket);
+                                bool after = id(g_aftermarket);
+                                bool preaft=pre || after;
                                 bool open=id(g_market_open);
+                                bool closed = !(open || pre || after);
+                                bool showAH = id(g_show_after_hours);
                                 float price = meta["regularMarketPrice"].as<float>();
                                 float pricef = meta["fulldayPrice"].as<float>();
                                 if(preaft) price=pricef;
@@ -1908,9 +2000,13 @@ script:
                                 if (preaft && !meta["fulldayChange"].isNull()) chg=meta["fulldayChange"].as<float>();
                                 else chg = price - prev;
                                 float pct = 0.0f;
-                                if (prev != 0.0f) pct = chg * 100.0f / prev;
-                                lv_obj_add_flag(id(lbl_loading), LV_OBJ_FLAG_HIDDEN);
-                                lv_obj_clear_flag(id(status_box), LV_OBJ_FLAG_HIDDEN);
+                                if(!meta["fulldayChangePercent"].isNull()) pct=meta["fulldayChangePercent"].as<float>();
+                                else {
+                                  if (prev != 0.0f) pct = chg * 100.0f / prev;
+                                }
+                                lv_obj_set_hidden(id(lbl_loading), true);
+                                lv_obj_set_hidden(id(status_box), false);
+                                ESP_LOGD("fetch_one","prc: %.4f chg:%.3f pct: %.3f",price,chg,pct);
                                 if (i == 0) {
                                   id(g_price_0) = price;
                                   id(g_chg_0) = chg;
@@ -1987,6 +2083,7 @@ script:
                                   size_t count = timestamps.size();
                                   if (closes.size() < count) count = closes.size();
 
+                                  int cnt=0;  
                                   for (size_t k = 0; k < count; k++) {
                                     if (timestamps[k].isNull() || closes[k].isNull()) continue;
 
@@ -2003,28 +2100,27 @@ script:
                                     int seconds = tmv.tm_hour * 3600 + tmv.tm_min * 60 + tmv.tm_sec;
 
                                     bool keep = false;
-
-                                    if (preaft && id(g_premarket)) {
+                                    if (pre) {
                                       // 04:00 - 09:30
                                       keep = minutes >= 4 * 60 && minutes < 9 * 60 + 30;
-                                    } else if (open) {
-                                      // 09:30 - 16:00
-                                      keep = minutes >= 9 * 60 + 30 && minutes < 16 * 60;
-                                    } else if (preaft && id(g_aftermarket)) {
+                                    } else if (after || (closed )) {  
                                       // Regular + after-hours: 09:30 - 20:00
                                       keep = minutes >= 9 * 60 + 30 && minutes < 20 * 60;
-                                    } else {
-                                      // CLOSED: last regular session
+                                    } else { // open 
+                                      // 09:30 - 16:00
                                       keep = minutes >= 9 * 60 + 30 && minutes < 16 * 60;
-                                    }
+                                    } 
 
                                     if (!keep) continue;
+                                    cnt++;
                                     char item[40];
                                     snprintf(item, sizeof(item), "%d|%.4f", seconds, close_value);
 
                                     if (!spark.empty()) spark.push_back(',');
                                     spark += item;
                                   }
+                                  ESP_LOGD("fetch_one","keep:  %d",cnt);
+
                                 }
 
                                 if (!spark.empty()) {
@@ -2037,6 +2133,7 @@ script:
                                 }                                
                                 return true;
                               });
+                              ESP_LOGI("fetch_one", "JSON parsed: %s", parsed ? "yes" : "no");
                               int i = id(g_fetch_i);
 
                               if (spark.empty() && parsed) {
@@ -2072,7 +2169,7 @@ script:
                               else if (i == 3) id(g_fetch_ms_3) = now;
                               else if (i == 4) id(g_fetch_ms_4) = now;
                               else if (i == 5) id(g_fetch_ms_5) = now;
-                              lv_obj_add_flag(id(http_box), LV_OBJ_FLAG_HIDDEN);
+                              lv_obj_set_hidden(id(http_box), true);
                           - script.execute: paint_active
 
                         else:
@@ -2085,7 +2182,7 @@ script:
     mode: restart
     then:
       - lambda: |-
-          lv_obj_clear_flag(id(http_box), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_set_hidden(id(http_box), false);
       - http_request.get:
           url: !lambda |-
             std::string cc = id(g_currency_code);
@@ -2138,11 +2235,13 @@ script:
               - script.execute: paint_active
         
       - lambda: |-
-           lv_obj_add_flag(id(http_box), LV_OBJ_FLAG_HIDDEN);
+           lv_obj_set_hidden(id(http_box), true);
 
   - id: fetch_all
     mode: single
     then:
+      - lambda: |-
+          ESP_LOGD("fetch_all","============== FETCH_ALL ==============");
       - delay: 2000ms
       - script.execute:
           id: fetch_from
@@ -2156,7 +2255,9 @@ script:
     then:
       - if:
           condition:
-            lambda: 'return slot >= 0 && slot < id(g_count);'
+            lambda: |-
+              ESP_LOGD("fetch_from","============== FETCH_FROM: %d ==============",slot);
+              return slot >= 0 && slot < id(g_count);
           then:
             - script.execute:
                 id: fetch_one
@@ -2178,6 +2279,9 @@ interval:
             - script.execute: fetch_current_if_due
       - lambda: |-
           if (lv_scr_act() == id(page_quote).obj) {
+            // ------------------------------------------------------------
+            // QUOTE PAGE 1s
+            // ------------------------------------------------------------            
             int ts = 0;
             int i=id(g_index);
             if (i == 0) ts = id(g_ts_0);
@@ -2196,9 +2300,9 @@ interval:
               if (age < 0) age = 0;
               char rel[24];
               if (nowt < 100000) rel[0] = '\0';
-              else if (age < 60) snprintf(rel, sizeof(rel), "%d sec", age);
-              else if (age < 3600) snprintf(rel, sizeof(rel), "%d min", age / 60);
-              else if (age < 86400) snprintf(rel, sizeof(rel), "%d hour", age / 3600);
+              else if (age < 100) snprintf(rel, sizeof(rel), "%d sec", age);
+              else if (age < 5400) snprintf(rel, sizeof(rel), "%.1f min", (float)age / 60);
+              else if (age < 86400) snprintf(rel, sizeof(rel), "%.1f hour", (float)age / 3600);
               else snprintf(rel, sizeof(rel), "%d day", age / 86400);
               snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d %s", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, rel);
               lv_label_set_text(id(lbl_when), buf);
@@ -2262,7 +2366,7 @@ interval:
       - lambda: |-
           //if (lv_scr_act() != id(page_info).obj) return; 
           // ------------------------------------------------------------
-          // SYSTEM INFO 1s
+          // SYSTEM INFO 30s
           // ------------------------------------------------------------
           char b[160];
           auto t = id(sntp_time).now();
@@ -2375,6 +2479,47 @@ lvgl:
   color_depth: 16
   buffer_size: 25%
   page_wrap: false
+  widgets:
+    - keyboard:
+        id: setup_kb
+        hidden: true
+        align: BOTTOM_MID
+        width: 480
+        height: 180
+        textarea: ta_tickers
+        mode: TEXT_UPPER
+        bg_color: 0x161614
+        text_color: 0xf0f0f0
+        text_font: montserrat_24
+        border_width: 0
+        items:
+          bg_color: 0x2a2824
+          text_color: 0xf2efe8
+          text_font: montserrat_24
+          radius: 6
+          pressed:
+            bg_color: 0x3a3834
+            text_color: 0xffffff
+          checked:
+            bg_color: 0x4a4844
+            text_color: 0xffffff
+        on_cancel:
+          then:
+            - lambda: |-
+                lv_obj_clear_state(id(ta_tickers), LV_STATE_FOCUSED);
+                lv_obj_clear_state(id(ta_shares), LV_STATE_FOCUSED);
+                lv_obj_clear_state(id(ta_currency), LV_STATE_FOCUSED);
+            - lvgl.widget.focus: backlight_slider
+            - lvgl.widget.hide: setup_kb            
+        on_ready:
+          then:
+            - lambda: |-
+                lv_obj_set_hidden(id(setup_kb).obj, false);
+                lv_obj_set_align(id(setup_kb).obj, LV_ALIGN_BOTTOM_MID);
+                lv_obj_set_pos(id(setup_kb).obj, 0, 0);
+                lv_obj_move_foreground(id(setup_kb).obj);
+            - lvgl.widget.focus: backlight_slider
+            - lvgl.widget.hide: setup_kb            
   pages:
     - id: page_splash
       bg_color: 0x000040
@@ -2388,27 +2533,39 @@ lvgl:
             height: 480
         - label:
             id: lbl_appname
-            text: "StoxBox "
-            text_font: font_value
+            text: "v0.60"
+            text_font: font_version
             text_color: 0xe0e0e0  
             x: 20
-            y: 20
+            y: 101
             width: 240
+#            hidden: true
+        - label:
+            id: lbl_boot_status
+            text: "Connecting Wi-Fi..."
+            text_font: font_ui
+            text_color: 0xd0d0d4  
+            bg_color: red
+            bg_opa: 10%
+            x: 10
+            y: 450
+            height: 30
+            width: 315
         - label:
             id: lbl_author
             text: "by pel.hu"
             text_font: font_chg
-            text_color: 0xe0e0e0  
+            text_color: 0xd0d0d4  
             x: 336
             y: 435
         - obj:
             id: ota_box
-            x: 80
-            y: 150
-            width: 320
+            x: 95
+            y: 175
+            width: 290
             height: 230
             radius: 10
-            bg_color: 0x10261c
+            bg_color: 0x444444
             border_width: 0
             border_color: 0x3dcf8e
             bg_opa: 50%    
@@ -2432,10 +2589,10 @@ lvgl:
                   id: ota_progress_bar
                   align: TOP_MID
                   y: 185
-                  width: 280
+                  width: 260
                   height: 20
                   min_value: 0
-                  max_value: 100
+                  max_value: 94
                   value: 0   
                   bg_color: 0x26302B
                   bg_opa: 30%
@@ -2457,6 +2614,12 @@ lvgl:
               lv_indev_wait_release(lv_indev_get_act());
           - lvgl.page.show:
               id: page_setup
+      on_swipe_left:
+        then:
+          - lambda: |-
+              lv_indev_wait_release(lv_indev_get_act());
+          - lvgl.page.show:
+              id: page_splash
       widgets:
         - image:
             id: back_img_info
@@ -2793,14 +2956,12 @@ lvgl:
               int shcnt = id(g_shcnt);
               if (n > 1) {
                 int i = id(g_index) + 1;
-                ESP_LOGD("swipe_left","before n: %d, i: %d, shcnt: %d",n,i,shcnt);
                 if (shcnt>1) {
                   if (i > n) i = 0;
                 } else {
                   if (i >= n) i = 0;
                 }
                 id(g_index) = i;
-                ESP_LOGD("swipe_left","after n: %d, i: %d, shcnt: %d",n,i,shcnt);
                 lv_label_set_text(id(lbl_name), "");
               }
           - script.execute: paint_active
@@ -2846,7 +3007,7 @@ lvgl:
               } else {
                 stoxbox_sd_apply_assets(id(splash_logo_img), id(back_img_quote), id(back_img_setup), id(back_img_info));
               }              
-      on_double_click:
+      on_single_click:
         then:
           - lambda: |-
               if(id(g_count) == id(g_index)) {
@@ -2911,7 +3072,7 @@ lvgl:
         - label:
             id: lbl_name
             text: ""
-            text_font: font_setup
+            text_font: font_ticker
             text_color: 0xc8c4bc
             long_mode: DOT
             width: 320
@@ -2935,7 +3096,7 @@ lvgl:
               - label:
                   id: lbl_status
                   text: "-----"
-                  text_font: font_ui
+                  text_font: font_ticker
                   text_color: 0x3dcf8e
                   align: CENTER
         - obj:
@@ -2966,6 +3127,10 @@ lvgl:
             long_mode: CLIP
             x: 2
             y: 56
+#            on_double_click:
+#              then:
+#              - lvgl.page.show:
+#                  id: page_setup        
         - label:
             id: lbl_chg
             text: ""
@@ -2976,7 +3141,7 @@ lvgl:
             y: 164
         - label:
             id: lbl_hl
-            text: "H  -      L  -"
+            text: ""
             text_font: font_chg
             text_color: 0x8a8780
             x: 240
@@ -3018,11 +3183,16 @@ lvgl:
             y: 244
             width: 480
             height: 200
-            line_width: 3
+            line_width: 5
             line_rounded: true
             line_color: 0x3dcf8e
             points:
               - 0, 32
+            on_single_click:
+              then:
+                - lambda: |-
+                    id(g_show_after_hours) = !id(g_show_after_hours);
+                - script.execute: paint_active    
         - label:
             id: lbl_qty
             text: "0 share"
@@ -3055,7 +3225,8 @@ lvgl:
                 - lambda: |-  
                     lv_timer_handler();
                 - delay: 50ms    
-                - script.execute: fetch_current_if_due            
+                - script.execute: fetch_current_if_due
+            
         - label:
             id: ticker_1
             text: ""
@@ -3074,7 +3245,7 @@ lvgl:
                 - lambda: |-  
                     lv_timer_handler();
                 - delay: 50ms    
-                - script.execute: fetch_current_if_due            
+                - script.execute: fetch_current_if_due
         - label:
             id: ticker_2
             text: ""
@@ -3093,7 +3264,7 @@ lvgl:
                 - lambda: |-  
                     lv_timer_handler();
                 - delay: 50ms    
-                - script.execute: fetch_current_if_due            
+                - script.execute: fetch_current_if_due
         - label:
             id: ticker_3
             text: ""
@@ -3109,7 +3280,10 @@ lvgl:
                 - lambda: |-
                     id(g_index) = 3;
                 - script.execute: paint_active
-                - script.execute: fetch_current_if_due            
+                - lambda: |-  
+                    lv_timer_handler();
+                - delay: 50ms    
+                - script.execute: fetch_current_if_due
         - label:
             id: ticker_4
             text: ""
@@ -3128,7 +3302,8 @@ lvgl:
                 - lambda: |-  
                     lv_timer_handler();
                 - delay: 50ms    
-                - script.execute: fetch_current_if_due            
+                - script.execute: fetch_current_if_due
+            
         - label:
             id: ticker_5
             text: ""
@@ -3147,7 +3322,8 @@ lvgl:
                 - lambda: |-  
                     lv_timer_handler();
                 - delay: 50ms    
-                - script.execute: fetch_current_if_due            
+                - script.execute: fetch_current_if_due
+            
         - label:
             id: ticker_sum
             text: "SUM"
@@ -3164,7 +3340,218 @@ lvgl:
                 - lambda: |-
                     id(g_index) = id(g_count);
                     lv_label_set_text(id(lbl_name), "");
-                - script.execute: paint_active            
+                - script.execute: paint_active
+                - lambda: |-  
+                    lv_timer_handler();
+#                - delay: 50ms    
+    - id: page_wifi_setup
+      skip: false
+#      bg_color: 0x050504
+      scrollbar_mode: "OFF"
+      scrollable: false
+      on_load:
+        then:
+          - lambda: |-
+              lv_obj_set_hidden(id(setup_kb).obj, true);
+      on_swipe_up:
+        then:
+          - lambda: |-
+                lv_indev_wait_release(lv_indev_get_act());
+          - script.execute: commit_setup_fields
+          - lvgl.page.show:
+              id: page_info
+      on_swipe_down:
+        then:
+          - lambda: |-
+                lv_indev_wait_release(lv_indev_get_act());
+          - script.execute: commit_setup_fields
+          - lvgl.page.show:
+              id: page_quote
+      on_swipe_left:
+        then:
+          - lambda: |-
+              lv_indev_wait_release(lv_indev_get_act());
+          - lvgl.page.show:
+              id: page_setup
+      on_swipe_right:
+        then:
+          - lambda: |-
+              lv_indev_wait_release(lv_indev_get_act());
+          - lvgl.page.show:
+              id: page_setup
+      widgets:
+        - image:
+            id: back_img_wifi
+            src: img_back
+            x: 0
+            y: 0
+            width: 480
+            height: 480
+        - label:
+            text: "SSID"
+            text_font: font_ui
+            text_color: 0x8a8780
+            x: 8
+            y: 16
+        - textarea:
+            id: ta_ssid
+            x: 68
+            y: 4
+            width: 408
+            height: 48
+            cursor:
+              bg_color: 0xffffff   
+              bg_opa: TRANSP        
+              border_width: 0
+              border_color: 0x161614
+              focused:
+                bg_opa: COVER              
+            one_line: true
+            text: ""
+#            placeholder_text: ""
+            accepted_chars: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789, #abcdefghijklmnopqrstuvwxyz.^-*="
+            max_length: 46
+            text_font: font_setup
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            radius: 10
+            pad_all: 10
+            on_ready:
+              if:
+                condition:
+                  lambda: |-
+                    const char *tssid = lv_textarea_get_text(id(ta_ssid));
+                    std::string new_val = (tssid != nullptr) ? std::string(tssid) : "";
+                    if (id(g_ssid) == new_val) {
+                      return false;
+                    }
+                    id(g_ssid) = new_val;
+                    global_preferences->sync();
+                    return true;
+                then:
+                  - script.execute: get_tickers
+                  - script.execute: fetch_all
+            on_focus:
+              then:
+                - lambda: |-
+                    lv_obj_set_parent(id(setup_kb).obj, lv_scr_act());
+                - lvgl.widget.show: setup_kb
+                - lvgl.keyboard.update:
+                    id: setup_kb
+                    textarea: ta_ssid
+                    mode: TEXT_LOWER
+        - label:
+            text: "Password"
+            text_font: font_ui
+            text_color: 0x8a8780
+            x: 8
+            y: 82
+        - textarea:
+            id: ta_password
+            x: 122
+            y: 70
+            width: 240
+            height: 48
+            password_mode: true
+            cursor:
+              bg_color: 0xffffff   
+              bg_opa: TRANSP        
+              border_width: 1      
+              border_color: 0x161614
+              focused:
+                bg_opa: COVER              
+            one_line: true
+            text: ""
+#            placeholder_text: ""
+            accepted_chars: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789, #abcdefghijklmnopqrstuvwxyz.^-*="
+            max_length: 36
+            text_font: font_setup
+            text_color: 0xf2efe8
+            bg_color: 0x161614
+            border_width: 2
+            border_color: 0x3a3834
+            radius: 10
+            pad_all: 10
+            on_ready:
+              if:
+                condition:
+                  lambda: |-
+                    const char *tpwd = lv_textarea_get_text(id(ta_shares));
+                    std::string new_val = (tpwd != nullptr) ? std::string(tpwd) : "";
+                    if (id(g_password) == new_val) {
+                      return false;
+                    }
+                    id(g_password) = new_val;
+                    global_preferences->sync();
+                    return true;
+                then:
+                  - script.execute: get_shares
+            on_focus:
+              then:
+                - lambda: |-
+                    lv_obj_set_parent(id(setup_kb).obj, lv_scr_act());
+                - lvgl.widget.show: setup_kb
+                - lvgl.keyboard.update:
+                    id: setup_kb
+                    textarea: ta_password
+                    mode: TEXT_LOWER
+        - checkbox:
+            id: chb_showpwd
+            x: 374
+            y: 82
+            text: "show"
+            pad_column: 10       
+            bg_color: 0x161614
+            border_color: 0x363634
+            text_font: font_ui
+            text_color: 0x8a8780            
+            on_change:
+              then:
+                - lambda: |-
+                    static bool show_password = false;
+                    show_password = !show_password;
+                    lv_textarea_set_password_mode(id(ta_password),!show_password);
+        - button:
+            id: btn_connect
+            x: 8
+            y: 140
+            width: 120
+            height: 40
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Connect" 
+                  text_font: font_setup
+            on_click:
+              then:
+                - script.execute: apply_wifi_settings
+        - obj:
+            id: scan_box
+            x: 8
+            y: 215
+            width: 464
+            height: 265 
+            bg_color: 0x000080
+            bg_opa: 20%
+            border_color: 0x000080
+            border_opa: 100%
+            radius: 10
+            widgets:
+            - label:
+                text: "WiFi scan"
+                text_font: font_setup
+                text_color: 0xaaa7a0
+                align: TOP_MID
+                y: -10
+            - label:
+                id: lbl_wifi_scan
+                text_font: font_setup
+                text_color: 0xaaa7a0
+                align: TOP_MID
+                y: 30
+                
     - id: page_setup
       skip: false
 #      bg_color: 0x050504
@@ -3173,18 +3560,18 @@ lvgl:
       on_load:
         then:
           - lambda: |-
-              lv_obj_add_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
+              lv_obj_set_hidden(id(setup_kb).obj, true);
           - lvgl.widget.focus: backlight_slider    
       on_swipe_up:
         then:
           - lambda: |-
                 lv_indev_wait_release(lv_indev_get_act());
           - script.execute: commit_setup_fields
-          - light.turn_off: display_backlight    
+#          - light.turn_off: display_backlight    
           - lvgl.page.show:
               id: page_info
-          - delay: 250ms  
-          - light.turn_on: display_backlight    
+#          - delay: 250ms  
+#          - light.turn_on: display_backlight    
       on_swipe_down:
         then:
           - lambda: |-
@@ -3192,6 +3579,19 @@ lvgl:
           - script.execute: commit_setup_fields
           - lvgl.page.show:
               id: page_quote
+      on_swipe_left:
+        then:
+          - lambda: |-
+              lv_indev_wait_release(lv_indev_get_act());
+          - lvgl.page.show:
+              id: page_wifi_setup
+      on_swipe_right:
+        then:
+          - lambda: |-
+              lv_indev_wait_release(lv_indev_get_act());
+          - lvgl.page.show:
+              id: page_wifi_setup
+              
       widgets:
         - image:
             id: back_img_setup
@@ -3202,7 +3602,7 @@ lvgl:
             height: 480
         - label:
             text: "Ticker list"
-            text_font: font_setup
+            text_font: font_ui
             text_color: 0x8a8780
             x: 8
             y: 0
@@ -3249,6 +3649,8 @@ lvgl:
                   - script.execute: fetch_all
             on_focus:
               then:
+                - lambda: |-
+                    lv_obj_set_parent(id(setup_kb).obj, lv_scr_act());
                 - lvgl.widget.show: setup_kb
                 - lvgl.keyboard.update:
                     id: setup_kb
@@ -3256,7 +3658,7 @@ lvgl:
                     mode: TEXT_UPPER
         - label:
             text: "Shares list"
-            text_font: font_setup
+            text_font: font_ui
             text_color: 0x8a8780
             x: 8
             y: 112
@@ -3302,6 +3704,8 @@ lvgl:
                   - script.execute: get_shares
             on_focus:
               then:
+                - lambda: |-
+                    lv_obj_set_parent(id(setup_kb).obj, lv_scr_act());
                 - lvgl.widget.show: setup_kb
                 - lvgl.keyboard.update:
                     id: setup_kb
@@ -3356,6 +3760,8 @@ lvgl:
                   - script.execute: fetch_currency
             on_focus:
               then:
+                - lambda: |-
+                    lv_obj_set_parent(id(setup_kb).obj, lv_scr_act());
                 - lvgl.widget.show: setup_kb
                 - lvgl.keyboard.update:
                     id: setup_kb
@@ -3623,49 +4029,10 @@ lvgl:
                   text_color: 0xf0f0f0
             on_click:
               then:
-                - light.turn_off: display_backlight
+                - output.turn_off: backlight_output
+#                - light.turn_off: display_backlight
                 - script.execute: restart_device
-        - keyboard:
-            id: setup_kb
-            hidden: true
-            align: BOTTOM_MID
-            width: 480
-            height: 180
-            textarea: ta_tickers
-            mode: TEXT_UPPER
-            bg_color: 0x161614
-            text_color: 0xf0f0f0
-            text_font: montserrat_24
-            border_width: 0
-            items:
-              bg_color: 0x2a2824
-              text_color: 0xf2efe8
-              text_font: montserrat_24
-              radius: 6
-              pressed:
-                bg_color: 0x3a3834
-                text_color: 0xffffff
-              checked:
-                bg_color: 0x4a4844
-                text_color: 0xffffff
-            on_cancel:
-              then:
-                - lambda: |-
-                    lv_obj_clear_state(id(ta_tickers), LV_STATE_FOCUSED);
-                    lv_obj_clear_state(id(ta_shares), LV_STATE_FOCUSED);
-                    lv_obj_clear_state(id(ta_currency), LV_STATE_FOCUSED);
-                - lvgl.widget.focus: backlight_slider
-                - lvgl.widget.hide: setup_kb            
-            on_ready:
-              then:
-                - lambda: |-
-                    lv_obj_clear_flag(id(setup_kb).obj, LV_OBJ_FLAG_HIDDEN);
-                    lv_obj_set_align(id(setup_kb).obj, LV_ALIGN_BOTTOM_MID);
-                    lv_obj_set_pos(id(setup_kb).obj, 0, 0);
-                    lv_obj_move_foreground(id(setup_kb).obj);
-                - lvgl.widget.focus: backlight_slider
-                - lvgl.widget.hide: setup_kb            
-
+  
 select:
   - platform: template
     name: "Display rotation"
@@ -3920,6 +4287,106 @@ sensor:
 
 
 text_sensor:
+  - platform: wifi_info
+    scan_results:
+      name: "Scan Results"
+      id: wifi_scan
+      on_value:
+        then:
+          - lambda: |-
+              std::string result = x;
+              std::string formatted;
+              size_t pos = 0;
+              while ((pos = result.find("dB ", pos)) != std::string::npos) {
+                result.replace(pos, 3, "dB\n");
+                pos += 3;
+              }
+              formatted = result;
+              lv_label_set_text(id(lbl_wifi_scan), formatted.c_str());
+              //return;
+
+              #include <vector>
+              #include <algorithm>
+
+              std::vector<std::string> lines;
+              std::string input = x;
+              pos = 0;
+
+              while (pos < input.size()) {
+                size_t end = input.find("dB ", pos);
+                if (end == std::string::npos) {
+                  std::string last = input.substr(pos);
+                  if (!last.empty()) lines.push_back(last);
+                  break;
+                }
+
+                lines.push_back(input.substr(pos, end + 2 - pos));
+                pos = end + 3;
+              }
+
+              auto get_rssi = [](const std::string &s) -> int {
+                size_t p = s.rfind(':');
+                if (p == std::string::npos) return -999;
+                return atoi(s.c_str() + p + 1);
+              };
+
+              std::stable_sort(lines.begin(), lines.end(),
+                [&](const std::string &a, const std::string &b) {
+                  return get_rssi(a) > get_rssi(b);
+                });
+
+              std::string output;
+              for (const auto &line : lines) {
+                output += line + "\n";
+              }
+
+              lv_label_set_text(id(lbl_wifi_scan), output.c_str());
+              return;
+              
+              //#include <vector>
+              //#include <algorithm>
+
+              //struct WifiEntry {
+              //  std::string ssid;
+              //  int rssi;
+              //};
+
+              //std::vector<WifiEntry> networks;
+              //std::string input = x;
+              //size_t pos = 0;
+
+              //while (pos < input.size()) {
+              //  size_t colon = input.find(": ", pos);
+              //  if (colon == std::string::npos) break;
+
+              //  size_t db = input.find("dB", colon + 2);
+              //  if (db == std::string::npos) break;
+
+              //  std::string ssid = input.substr(pos, colon - pos);
+              //  std::string signal = input.substr(colon + 2, db - (colon + 2));
+
+                // RSSI feldolgozása
+              //  int rssi = atoi(signal.c_str());
+              //  networks.push_back({ssid, rssi});
+
+              //  pos = db + 2;
+              //  while (pos < input.size() && input[pos] == ' ') pos++;
+              //}
+
+              //std::stable_sort(
+              //  networks.begin(), networks.end(),
+              //  [](const WifiEntry &a, const WifiEntry &b) {
+              //    return a.rssi > b.rssi;
+              //  }
+              //);
+
+              //std::string output;
+              //for (const auto &n : networks) {
+              //  output += n.ssid + ": " +
+              //            std::to_string(n.rssi) + " dBm\n";
+              //}
+
+              //lv_label_set_text(id(lbl_wifi_scan), output.c_str());  
   - platform: template
     name: "Version"
     lambda: |-
@@ -3985,6 +4452,10 @@ text_sensor:
         return id(g_sym_5);
 
 button:
+  - platform: restart
+    icon: mdi:power-cycle
+    name: "ESP Reboot"          
+
   - platform: template
     name: "Take screenshot (SD)"
     id: ha_screenshot_sd
